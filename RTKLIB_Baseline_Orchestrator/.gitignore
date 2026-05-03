@@ -1,0 +1,71 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ginanenv/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Runtime outputs
+RTK_process/
+runs/
+logs/
+*.log
+*.trace
+*.stdout
+*.stderr
+
+# RTKLIB generated files
+*.pos
+*.stat
+*.conf
+*.cmd
+
+# Reports and generated CSV outputs
+bases.solution.report.html
+final_baseline_solutions.csv
+*_comparison*.csv
+*_coordinates.csv
+*_differences*.csv
+section15_plot_check.png
+
+# Large GNSS data/products - do not version control
+*.rnx
+*.crx
+*.crx.gz
+*.gz
+*.Z
+*.sp3
+*.SP3
+*.clk
+*.CLK
+*.erp
+*.ERP
+*.bia
+*.BIA
+*.snx
+*.SNX
+*.atx
+*.ATX
+*.ion
+*.ION
+*.blq
+*.BLQ
+
+# Local user-specific launchers/backups
+*.desktop
+*_OLD/
+
+# Development notebooks
+DEV/
