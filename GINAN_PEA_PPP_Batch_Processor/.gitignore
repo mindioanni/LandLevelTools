@@ -1,0 +1,50 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Development / backup files
+*.bak*
+*.broken*
+dev_notebooks/
+archive_non_runtime_*/
+Version_*_fully working/
+
+# Runtime outputs
+GINAN_process/
+outputs/
+logs/
+*.log
+*.out
+*.TRACE
+*.trace
+*.POS
+*.pos
+*.csv
+*.html
+
+# GNSS input/product files
+*.rnx
+*.crx
+*.crx.gz
+*.gz
+*.Z
+*.sp3
+*.SP3
+*.clk
+*.CLK
+*.BIA
+*.bia
+*.SNX
+*.snx
+*.ATX
+*.atx
+*.ERP
+*.erp
+*.ION
+*.ion
+*.BLQ
+*.blq
+
+# Local launchers
+*.desktop
