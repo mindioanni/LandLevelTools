@@ -69,3 +69,9 @@ section15_plot_check.png
 
 # Development notebooks
 DEV/
+
+# Local backups and working snapshots
+*.bak*
+V1_working/
+V2_working/
+tmp_precise_test/

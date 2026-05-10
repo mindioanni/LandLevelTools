@@ -130,10 +130,74 @@ def _prepare_sp3_files_for_rtklib_242(
     return compatible_sp3_files
 
 
+def _rtklib_anttype_from_rinex_ant(antenna: str | None) -> str:
+    """
+    Convert RINEX ANT # / TYPE text to RTKLIB ant*-anttype text.
+
+    Handles both:
+        "HITV500"                 -> "HITV500         NONE"
+        "HITV500 NONE"            -> "HITV500         NONE"
+        "16578337 HITV500"        -> "HITV500         NONE"
+        "15095061 LEIAR10 NONE"   -> "LEIAR10         NONE"
+
+    RINEX ANT # / TYPE often contains:
+        antenna_serial antenna_type radome
+    RTKLIB ant*-anttype must contain:
+        antenna_type radome
+    """
+    s = (antenna or "").strip()
+    if not s:
+        return ""
+
+    parts = s.split()
+    if not parts:
+        return ""
+
+    # If the first token is a serial number, skip it.
+    if parts[0].isdigit() and len(parts) >= 2:
+        parts = parts[1:]
+
+    model = parts[0]
+    radome = parts[1] if len(parts) >= 2 else "NONE"
+
+    return f"{model:<16}{radome}"
+
+
+def _append_explicit_receiver_antenna_options(lines: list[str], pair: BaselinePair) -> None:
+    """
+    Append explicit receiver antenna PCV/PCO options.
+
+    The solution remains antenna-to-antenna:
+    ant*-antdel* are forced to zero so no marker/BM height transfer is applied
+    inside RTKLIB.
+    """
+    rover_ant = _rtklib_anttype_from_rinex_ant(getattr(pair.rover, "antenna", ""))
+    base_ant = _rtklib_anttype_from_rinex_ant(getattr(pair.base, "antenna", ""))
+
+    lines.append("pos1-posopt1      =on")
+    lines.append("pos1-posopt2      =on")
+
+    if rover_ant:
+        lines.append(f"ant1-anttype      ={rover_ant}")
+    if base_ant:
+        lines.append(f"ant2-anttype      ={base_ant}")
+
+    lines.extend([
+        "ant1-antdele      =0.0000",
+        "ant1-antdeln      =0.0000",
+        "ant1-antdelu      =0.0000",
+        "ant2-antdele      =0.0000",
+        "ant2-antdeln      =0.0000",
+        "ant2-antdelu      =0.0000",
+    ])
+
+
+
 def build_conf_text(
     inputs: UserInputs,
     cors: CorsSolution,
     products: ResolvedProducts,
+    pair: BaselinePair,
 ) -> str:
     product_mode = str(inputs.product_mode).strip().lower()
 
@@ -166,6 +230,7 @@ def build_conf_text(
     if products.antex_file:
         lines.append(f"file-satantfile    ={products.antex_file}")
         lines.append(f"file-rcvantfile    ={products.antex_file}")
+        _append_explicit_receiver_antenna_options(lines, pair)
 
     if products.blq_file:
         lines.append(f"file-blqfile       ={products.blq_file}")
@@ -188,7 +253,7 @@ def build_run_config(
 
     compatible_sp3_files = _prepare_sp3_files_for_rtklib_242(inputs, products)
 
-    conf_text = build_conf_text(inputs, cors, products)
+    conf_text = build_conf_text(inputs, cors, products, pair)
     conf_path.write_text(conf_text, encoding="utf-8")
 
     command = [

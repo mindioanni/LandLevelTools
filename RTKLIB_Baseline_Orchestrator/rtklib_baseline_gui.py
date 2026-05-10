@@ -94,6 +94,7 @@ class RTKLIBBaselineGUI(tk.Tk):
         self.status_var = tk.StringVar(value="Ready.")
 
         self._build_layout()
+        self._sync_qc_final_window_state()
         self._poll_output_queue()
 
     def _browse_file(self, var, title):
@@ -208,16 +209,47 @@ class RTKLIBBaselineGUI(tk.Tk):
     def _build_qc_tab(self, nb):
         tab = ttk.Frame(nb, padding=10)
         nb.add(tab, text="QC / final solution")
-        ttk.Label(tab, text="Final solution window (min)").grid(row=0, column=0, sticky="w", padx=(0,8), pady=4)
-        ttk.Entry(tab, textvariable=self.final_window_var, width=18).grid(row=0, column=1, sticky="w", pady=4)
-        ttk.Label(tab, text="Recommended minimum final solution window: 15 min").grid(row=1, column=1, sticky="w", pady=(0,8))
 
-        ttk.Checkbutton(tab, text="Use Q=1 fixed only for final solution", variable=self.q1_only_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=4)
+        self.final_window_label = ttk.Label(tab, text="Final window for all-Q fallback mode (min)")
+        self.final_window_label.grid(row=0, column=0, sticky="w", padx=(0,8), pady=4)
+
+        self.final_window_entry = ttk.Entry(tab, textvariable=self.final_window_var, width=18)
+        self.final_window_entry.grid(row=0, column=1, sticky="w", pady=4)
+
+        self.final_window_note = ttk.Label(
+            tab,
+            text="Disabled when the final solution uses all Q=1 fixed POS epochs."
+        )
+        self.final_window_note.grid(row=1, column=1, sticky="w", pady=(0,8))
+
+        self.q1_only_check = ttk.Checkbutton(
+            tab,
+            text="Use all Q=1 fixed POS epochs for final solution",
+            variable=self.q1_only_var,
+            command=self._sync_qc_final_window_state,
+        )
+        self.q1_only_check.grid(row=2, column=0, columnspan=2, sticky="w", pady=4)
+
         ttk.Label(tab, text="Minimum fixed percentage (%)").grid(row=3, column=0, sticky="w", padx=(0,8), pady=4)
         ttk.Entry(tab, textvariable=self.min_fixed_percent_var, width=18).grid(row=3, column=1, sticky="w", pady=4)
+
         ttk.Label(tab, text="Minimum ratio for fixed epochs").grid(row=4, column=0, sticky="w", padx=(0,8), pady=4)
         ttk.Entry(tab, textvariable=self.min_ratio_var, width=18).grid(row=4, column=1, sticky="w", pady=4)
+
         ttk.Checkbutton(tab, text="Generate plots", variable=self.generate_plots_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=4)
+
+    def _sync_qc_final_window_state(self):
+        """
+        The final-window value is only used when Q=1 fixed-only mode is disabled.
+        In fixed-only mode the final solution is computed from all Q=1 fixed POS epochs.
+        """
+        if not hasattr(self, "final_window_entry"):
+            return
+
+        if self.q1_only_var.get():
+            self.final_window_entry.configure(state="disabled")
+        else:
+            self.final_window_entry.configure(state="normal")
 
     def _build_execution_tab(self, nb):
         tab = ttk.Frame(nb, padding=10)

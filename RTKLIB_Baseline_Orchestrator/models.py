@@ -47,6 +47,7 @@ class UserInputs:
     q_fixed_only_for_final: bool = True
     min_fixed_percent: float = 80.0
     min_ratio_for_fixed: float = 3.0
+    min_continuous_fixed_duration_sec: float = 300.0
     generate_plots: bool = True
 
     execution_mode: str = "run"
@@ -178,6 +179,14 @@ class BaselineSolution:
     ratio_min: float | None
     ratio_mean: float | None
     ratio_max: float | None
+    n_fixed_epochs_used: int | None = None
+    fixed_time_start: Any | None = None
+    fixed_time_end: Any | None = None
+    fixed_total_duration_min: float | None = None
+    longest_fixed_segment_start: Any | None = None
+    longest_fixed_segment_end: Any | None = None
+    longest_fixed_segment_duration_min: float | None = None
+    longest_fixed_segment_epochs: int | None = None
     qc_flags: list[str] = field(default_factory=list)
 
 

@@ -89,6 +89,74 @@ def _q_counts(df):
     return {int(k): int(v) for k, v in df["Q"].value_counts().to_dict().items()}
 
 
+def _fixed_segments(df: pd.DataFrame) -> tuple[list[dict], float | None]:
+    """
+    Identify continuous Q=1 fixed segments.
+
+    Continuity is determined from the median epoch spacing of the fixed epochs.
+    A new segment starts when the time gap exceeds 2.5 times the median spacing.
+    """
+    if df.empty or "time" not in df.columns:
+        return [], None
+
+    tmp = df.sort_values("time").copy()
+    times = pd.to_datetime(tmp["time"])
+
+    if len(times) < 2:
+        if len(times) == 1:
+            return [{
+                "start": times.iloc[0],
+                "end": times.iloc[0],
+                "duration_sec": 0.0,
+                "epochs": 1,
+            }], None
+        return [], None
+
+    dt_sec = times.diff().dt.total_seconds().dropna()
+    dt_sec = dt_sec[dt_sec > 0]
+
+    median_dt = float(dt_sec.median()) if not dt_sec.empty else None
+    gap_threshold = max(2.5 * median_dt, 2.0) if median_dt else 2.0
+
+    groups = []
+    current_start = 0
+
+    gaps = times.diff().dt.total_seconds().fillna(0.0)
+    for i in range(1, len(tmp)):
+        if float(gaps.iloc[i]) > gap_threshold:
+            groups.append((current_start, i - 1))
+            current_start = i
+    groups.append((current_start, len(tmp) - 1))
+
+    segments = []
+    for a, b in groups:
+        start = times.iloc[a]
+        end = times.iloc[b]
+        duration_sec = float((end - start).total_seconds())
+        if median_dt is not None and b > a:
+            duration_sec += median_dt
+        segments.append({
+            "start": start,
+            "end": end,
+            "duration_sec": duration_sec,
+            "epochs": int(b - a + 1),
+        })
+
+    return segments, median_dt
+
+
+def _segments_total_duration_min(segments: list[dict]) -> float | None:
+    if not segments:
+        return None
+    return sum(float(s["duration_sec"]) for s in segments) / 60.0
+
+
+def _longest_segment(segments: list[dict]) -> dict | None:
+    if not segments:
+        return None
+    return max(segments, key=lambda s: (float(s["duration_sec"]), int(s["epochs"])))
+
+
 def build_pos_qc_table(parsed: ParsedPos) -> dict:
     df = parsed.dataframe
     if df.empty:
@@ -141,6 +209,14 @@ def compute_baseline_solution(
             baseline_length_m=None,
             q1_fixed_percent=None,
             ratio_min=None, ratio_mean=None, ratio_max=None,
+            n_fixed_epochs_used=None,
+            fixed_time_start=None,
+            fixed_time_end=None,
+            fixed_total_duration_min=None,
+            longest_fixed_segment_start=None,
+            longest_fixed_segment_end=None,
+            longest_fixed_segment_duration_min=None,
+            longest_fixed_segment_epochs=None,
             qc_flags=["EMPTY_POS"],
         )
 
@@ -150,20 +226,46 @@ def compute_baseline_solution(
     if q1_percent < inputs.min_fixed_percent:
         qc_flags.append("LOW_FIXED_PERCENT")
 
-    window_start = df["time"].max() - pd.Timedelta(minutes=float(inputs.final_window_minutes))
-    final_df = df[df["time"] >= window_start]
+    fixed_df = df[df["Q"] == 1].copy() if "Q" in df.columns else pd.DataFrame()
+    fixed_segments, fixed_median_dt_sec = _fixed_segments(fixed_df)
+    longest = _longest_segment(fixed_segments)
 
-    if inputs.final_window_minutes < inputs.recommended_min_final_window_minutes:
-        qc_flags.append("FINAL_WINDOW_BELOW_RECOMMENDED_MINIMUM")
+    n_fixed_epochs_used = int(len(fixed_df))
+    fixed_time_start = None
+    fixed_time_end = None
+    fixed_total_duration_min = _segments_total_duration_min(fixed_segments)
+    longest_fixed_segment_start = None
+    longest_fixed_segment_end = None
+    longest_fixed_segment_duration_min = None
+    longest_fixed_segment_epochs = None
+
+    if not fixed_df.empty:
+        fixed_time_start = pd.to_datetime(fixed_df["time"]).min()
+        fixed_time_end = pd.to_datetime(fixed_df["time"]).max()
+
+    if longest is not None:
+        longest_fixed_segment_start = longest["start"]
+        longest_fixed_segment_end = longest["end"]
+        longest_fixed_segment_duration_min = float(longest["duration_sec"]) / 60.0
+        longest_fixed_segment_epochs = int(longest["epochs"])
+
+        if float(longest["duration_sec"]) < float(inputs.min_continuous_fixed_duration_sec):
+            qc_flags.append("SHORT_LONGEST_FIXED_SEGMENT")
+
+    if len(fixed_segments) > 1:
+        qc_flags.append("FRAGMENTED_FIXED_SOLUTION")
 
     if inputs.q_fixed_only_for_final:
-        final_df = final_df[final_df["Q"] == 1]
-        solution_method = f"Q=1 fixed only, last {inputs.final_window_minutes:g} min"
+        final_df = fixed_df
+        solution_method = "all Q=1 fixed POS epochs"
+        if final_df.empty:
+            qc_flags.append("NO_FIXED_EPOCHS")
     else:
-        solution_method = f"all Q, last {inputs.final_window_minutes:g} min"
+        final_df = df.copy()
+        solution_method = "all POS epochs, Q not filtered"
+        qc_flags.append("ALL_Q_SOLUTION")
 
     if final_df.empty:
-        qc_flags.append("NO_EPOCHS_IN_FINAL_WINDOW")
         X = Y = Z = sx = sy = sz = None
         rover_lon_deg = rover_lat_deg = rover_h = None
         std_lon_m = std_lat_m = std_h_m = None
@@ -175,7 +277,7 @@ def compute_baseline_solution(
         rover_lat_deg = math.degrees(rover_lat_rad)
         rover_lon_deg = math.degrees(rover_lon_rad)
 
-        # Local scatter of final-window epochs around the final rover solution.
+        # Local scatter of selected epochs around the final rover solution.
         # std_lon_m = East scatter, std_lat_m = North scatter, std_h_m = Up scatter.
         e_res = []
         n_res = []
@@ -235,5 +337,13 @@ def compute_baseline_solution(
         ratio_min=_min(ratio_series),
         ratio_mean=_mean(ratio_series),
         ratio_max=_max(ratio_series),
+        n_fixed_epochs_used=n_fixed_epochs_used,
+        fixed_time_start=fixed_time_start,
+        fixed_time_end=fixed_time_end,
+        fixed_total_duration_min=fixed_total_duration_min,
+        longest_fixed_segment_start=longest_fixed_segment_start,
+        longest_fixed_segment_end=longest_fixed_segment_end,
+        longest_fixed_segment_duration_min=longest_fixed_segment_duration_min,
+        longest_fixed_segment_epochs=longest_fixed_segment_epochs,
         qc_flags=qc_flags,
     )

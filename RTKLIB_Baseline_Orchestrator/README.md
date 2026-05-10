@@ -149,7 +149,7 @@ Path to the `rnx2rtkp` executable used for processing.
 The reference setup uses RTKLIB 2.4.2 p13 compiled natively under Linux, for example:
 
 ```text
-~/apps/rtklib_native/RTKLIB_2.4.2_p13/app/rnx2rtkp/gcc/rnx2rtkp
+/home/ioannis/GNSS_TEST_WORK/rtklib_native/RTKLIB_2.4.2_p13/app/rnx2rtkp/gcc/rnx2rtkp
 ```
 
 ### Product provider, series and project
@@ -681,8 +681,8 @@ The workflow can use an optional external product downloader for missing GNSS pr
 In the reference setup, the downloader resources are:
 
 ```text
-Downloader script = ~/data/RINEX/ginan_batch_PPP/auto_download_PPP.py
-Downloader Python = ~/data/RINEX/ginan_batch_PPP/ginanenv/bin/python
+Downloader script = /home/ioannis/data/RINEX/ginan_batch_PPP/auto_download_PPP.py
+Downloader Python = /home/ioannis/data/RINEX/ginan_batch_PPP/ginanenv/bin/python
 ```
 
 These paths are system-specific and must be reviewed when the workflow is moved to another computer.
@@ -690,13 +690,13 @@ These paths are system-specific and must be reviewed when the workflow is moved 
 The default downloader Python path assumes that a dedicated Python virtual environment named `ginanenv` already exists under:
 
 ```text
-~/data/RINEX/ginan_batch_PPP/
+/home/ioannis/data/RINEX/ginan_batch_PPP/
 ```
 
 A similar environment can be created once on the target system, for example:
 
 ```bash
-cd ~/data/RINEX/ginan_batch_PPP
+cd /home/ioannis/data/RINEX/ginan_batch_PPP
 python3 -m venv ginanenv
 source ginanenv/bin/activate
 pip install --upgrade pip

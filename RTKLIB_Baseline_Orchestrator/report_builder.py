@@ -28,6 +28,21 @@ def _fmt(value, digits=4):
     return f"{value:.{digits}f}"
 
 
+
+def _rinex_duration_minutes(item) -> float | None:
+    first_obs = getattr(item, "first_obs", None)
+    last_obs = getattr(item, "last_obs", None)
+
+    if first_obs is None or last_obs is None:
+        return None
+
+    try:
+        return (last_obs - first_obs).total_seconds() / 60.0
+    except Exception:
+        return None
+
+
+
 def _html_table_from_records(records: list[dict], max_rows: int | None = None) -> str:
     if not records:
         return "<p>No records.</p>"
@@ -378,6 +393,327 @@ def _dynamic_trajectory_map(cors: CorsSolution, parsed_pos_items: list) -> str:
     return f'<img class="plot" src="data:image/png;base64,{encoded}" />'
 
 
+
+def _fixed_segment_diagnostic_records(parsed_pos_items: list | None, solutions: list[BaselineSolution]) -> list[dict]:
+    """
+    Build per-run diagnostics for continuous Q=1 fixed POS segments.
+
+    run_label is inferred from ParsedPos.path.stem, because RTKLIB output POS files
+    are written as <run_label>.pos.
+    """
+    if not parsed_pos_items:
+        return []
+
+    solution_by_run = {s.run_label: s for s in solutions}
+    records = []
+
+    for parsed in parsed_pos_items:
+        run_label = Path(parsed.path).stem
+        solution = solution_by_run.get(run_label)
+        solution_h = getattr(solution, "h_m", None) if solution is not None else None
+
+        df = parsed.dataframe.copy()
+        if df.empty or "Q" not in df.columns or "time" not in df.columns:
+            continue
+
+        fixed = df[df["Q"] == 1].copy()
+        if fixed.empty:
+            records.append({
+                "run_label": run_label,
+                "segment_id": None,
+                "segment_start": None,
+                "segment_end": None,
+                "duration_min": None,
+                "n_epochs": 0,
+                "mean_h_m": None,
+                "std_h_m": None,
+                "delta_h_from_solution_mean_m": None,
+                "note": "NO_Q1_FIXED_EPOCHS",
+            })
+            continue
+
+        fixed["time"] = pd.to_datetime(fixed["time"])
+        fixed = fixed.sort_values("time").reset_index(drop=True)
+
+        time_diffs = fixed["time"].diff().dt.total_seconds().dropna()
+        time_diffs = time_diffs[time_diffs > 0]
+        median_dt_sec = float(time_diffs.median()) if not time_diffs.empty else None
+        gap_threshold_sec = max(2.5 * median_dt_sec, 2.0) if median_dt_sec else 2.0
+
+        gaps = fixed["time"].diff().dt.total_seconds().fillna(0.0)
+        segment_start_idx = 0
+        segments = []
+
+        for i in range(1, len(fixed)):
+            if float(gaps.iloc[i]) > gap_threshold_sec:
+                segments.append((segment_start_idx, i - 1))
+                segment_start_idx = i
+        segments.append((segment_start_idx, len(fixed) - 1))
+
+        for seg_id, (a, b) in enumerate(segments, start=1):
+            seg = fixed.iloc[a:b+1].copy()
+            start_time = seg["time"].iloc[0]
+            end_time = seg["time"].iloc[-1]
+
+            duration_sec = float((end_time - start_time).total_seconds())
+            if median_dt_sec is not None and len(seg) > 1:
+                duration_sec += median_dt_sec
+
+            h_values = []
+            for _, row in seg.iterrows():
+                try:
+                    _, _, h = ecef_to_geodetic(float(row["X"]), float(row["Y"]), float(row["Z"]))
+                    h_values.append(h)
+                except Exception:
+                    pass
+
+            h_series = pd.Series(h_values, dtype="float64")
+            mean_h = float(h_series.mean()) if not h_series.empty else None
+            std_h = float(h_series.std(ddof=1)) if len(h_series) >= 2 else None
+            delta_h = (mean_h - solution_h) if (mean_h is not None and solution_h is not None) else None
+
+            records.append({
+                "run_label": run_label,
+                "segment_id": seg_id,
+                "segment_start": start_time,
+                "segment_end": end_time,
+                "duration_min": duration_sec / 60.0,
+                "n_epochs": int(len(seg)),
+                "mean_h_m": mean_h,
+                "std_h_m": std_h,
+                "delta_h_from_solution_mean_m": delta_h,
+                "note": "",
+            })
+
+    return records
+
+
+
+def _safe_float(value):
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _rss2(a, b):
+    a = _safe_float(a)
+    b = _safe_float(b)
+
+    if a is None and b is None:
+        return None
+    if a is None:
+        a = 0.0
+    if b is None:
+        b = 0.0
+
+    return math.sqrt(a*a + b*b)
+
+
+def _cors_enu_sigmas_from_xyz(cors: CorsSolution) -> tuple[float | None, float | None, float | None]:
+    """
+    Approximate CORS E/N/U standard deviations from diagonal XYZ standard deviations.
+
+    Assumption:
+    - CORS XYZ covariance terms are unavailable;
+    - std_X_m, std_Y_m, std_Z_m are treated as uncorrelated.
+    """
+    sx = _safe_float(cors.std_X_m)
+    sy = _safe_float(cors.std_Y_m)
+    sz = _safe_float(cors.std_Z_m)
+
+    if sx is None and sy is None and sz is None:
+        return None, None, None
+
+    sx = 0.0 if sx is None else sx
+    sy = 0.0 if sy is None else sy
+    sz = 0.0 if sz is None else sz
+
+    lat_rad, lon_rad, _ = ecef_to_geodetic(cors.X_m, cors.Y_m, cors.Z_m)
+    lat = float(lat_rad)
+    lon = float(lon_rad)
+
+    sin_lat = math.sin(lat)
+    cos_lat = math.cos(lat)
+    sin_lon = math.sin(lon)
+    cos_lon = math.cos(lon)
+
+    # ENU unit vectors in ECEF.
+    e = (-sin_lon, cos_lon, 0.0)
+    n = (-sin_lat * cos_lon, -sin_lat * sin_lon, cos_lat)
+    u = (cos_lat * cos_lon, cos_lat * sin_lon, sin_lat)
+
+    def proj_sigma(v):
+        return math.sqrt(
+            (v[0] * sx) ** 2 +
+            (v[1] * sy) ** 2 +
+            (v[2] * sz) ** 2
+        )
+
+    return proj_sigma(e), proj_sigma(n), proj_sigma(u)
+
+
+def _find_pair_for_solution(solution: BaselineSolution, pairs: list[BaselinePair]) -> BaselinePair | None:
+    for pair in pairs:
+        if pair.run_label == solution.run_label:
+            return pair
+    return None
+
+
+def _enu_offset_to_ecef(e_m: float, n_m: float, u_m: float, lat_deg: float, lon_deg: float) -> tuple[float, float, float]:
+    """
+    Convert a local ENU offset vector to ECEF dX,dY,dZ.
+
+    RINEX ANTENNA: DELTA H/E/N convention:
+    - H = Up offset from marker/BM to antenna
+    - E = East offset from marker/BM to antenna
+    - N = North offset from marker/BM to antenna
+
+    Therefore:
+        antenna_XYZ = BM_XYZ + ENU_to_ECEF(E, N, H)
+        BM_XYZ      = antenna_XYZ - ENU_to_ECEF(E, N, H)
+    """
+    lat = math.radians(float(lat_deg))
+    lon = math.radians(float(lon_deg))
+
+    sin_lat = math.sin(lat)
+    cos_lat = math.cos(lat)
+    sin_lon = math.sin(lon)
+    cos_lon = math.cos(lon)
+
+    dx = -sin_lon * e_m - sin_lat * cos_lon * n_m + cos_lat * cos_lon * u_m
+    dy =  cos_lon * e_m - sin_lat * sin_lon * n_m + cos_lat * sin_lon * u_m
+    dz =  cos_lat * n_m + sin_lat * u_m
+
+    return dx, dy, dz
+
+
+
+def _final_gnssbm_solution_records(
+    cors: CorsSolution,
+    pairs: list[BaselinePair],
+    solutions: list[BaselineSolution],
+) -> list[dict]:
+    """
+    Build final GNSSBM coordinate solution records.
+
+    RTKLIB solution strategy remains antenna-to-antenna.
+
+    This report-level transformation applies rover RINEX ANTENNA: DELTA H/E/N
+    to convert the solved antenna coordinate to the benchmark/marker coordinate:
+
+        BM_XYZ = antenna_XYZ - ENU_to_ECEF(E, N, H)
+
+    Current uncertainty propagation:
+    - RTKLIB per-run scatter + CORS PPP repeatability by RSS;
+    - antenna-height/eccentricity measurement uncertainty is not yet included.
+    """
+    cors_std_e, cors_std_n, cors_std_u = _cors_enu_sigmas_from_xyz(cors)
+
+    records = []
+
+    for s in solutions:
+        pair = _find_pair_for_solution(s, pairs)
+
+        antenna_delta_h_m = None
+        antenna_delta_e_m = None
+        antenna_delta_n_m = None
+        antenna_offset_source = "MISSING"
+        rover_file = s.rover_file
+
+        if pair is not None:
+            rover_file = pair.rover.path
+            antenna_delta_h_m = _safe_float(pair.rover.antenna_delta_h_m)
+            antenna_delta_e_m = _safe_float(pair.rover.antenna_delta_e_m)
+            antenna_delta_n_m = _safe_float(pair.rover.antenna_delta_n_m)
+
+            if antenna_delta_h_m is not None:
+                antenna_offset_source = "RINEX_ANTENNA_DELTA_H/E/N"
+
+        antenna_X = _safe_float(s.X_m)
+        antenna_Y = _safe_float(s.Y_m)
+        antenna_Z = _safe_float(s.Z_m)
+        antenna_lat = _safe_float(s.lat_deg)
+        antenna_lon = _safe_float(s.lon_deg)
+
+        bm_X = antenna_X
+        bm_Y = antenna_Y
+        bm_Z = antenna_Z
+        bm_lat_deg = _safe_float(s.lat_deg)
+        bm_lon_deg = _safe_float(s.lon_deg)
+        bm_h_m = _safe_float(s.h_m)
+
+        if (
+            antenna_X is not None and
+            antenna_Y is not None and
+            antenna_Z is not None and
+            antenna_lat is not None and
+            antenna_lon is not None and
+            antenna_delta_h_m is not None
+        ):
+            e_m = 0.0 if antenna_delta_e_m is None else antenna_delta_e_m
+            n_m = 0.0 if antenna_delta_n_m is None else antenna_delta_n_m
+            u_m = antenna_delta_h_m
+
+            dX, dY, dZ = _enu_offset_to_ecef(
+                e_m=e_m,
+                n_m=n_m,
+                u_m=u_m,
+                lat_deg=antenna_lat,
+                lon_deg=antenna_lon,
+            )
+
+            bm_X = antenna_X - dX
+            bm_Y = antenna_Y - dY
+            bm_Z = antenna_Z - dZ
+
+            bm_lat_rad, bm_lon_rad, bm_h_m = ecef_to_geodetic(bm_X, bm_Y, bm_Z)
+            bm_lat_deg = math.degrees(bm_lat_rad)
+            bm_lon_deg = math.degrees(bm_lon_rad)
+
+        records.append({
+            "run_label": s.run_label,
+            "benchmark_id": s.benchmark_id,
+            "rover_file": rover_file,
+
+            "antenna_delta_h_m": _fmt(antenna_delta_h_m),
+            "antenna_delta_e_m": _fmt(antenna_delta_e_m),
+            "antenna_delta_n_m": _fmt(antenna_delta_n_m),
+            "antenna_offset_source": antenna_offset_source,
+
+            "X_m": _fmt(bm_X),
+            "Y_m": _fmt(bm_Y),
+            "Z_m": _fmt(bm_Z),
+            "lon_deg": _fmt(bm_lon_deg, 10),
+            "lat_deg": _fmt(bm_lat_deg, 10),
+            "h_m": _fmt(bm_h_m, 4),
+
+            "std_X_m": _fmt(_rss2(s.std_X_m, cors.std_X_m)),
+            "std_Y_m": _fmt(_rss2(s.std_Y_m, cors.std_Y_m)),
+            "std_Z_m": _fmt(_rss2(s.std_Z_m, cors.std_Z_m)),
+            "std_lon_m": _fmt(_rss2(s.std_lon_m, cors_std_e)),
+            "std_lat_m": _fmt(_rss2(s.std_lat_m, cors_std_n)),
+            "std_h_m": _fmt(_rss2(s.std_h_m, cors_std_u)),
+
+            "rtklib_X_antenna_m": _fmt(s.X_m),
+            "rtklib_Y_antenna_m": _fmt(s.Y_m),
+            "rtklib_Z_antenna_m": _fmt(s.Z_m),
+            "rtklib_lon_antenna_deg": _fmt(s.lon_deg, 10),
+            "rtklib_lat_antenna_deg": _fmt(s.lat_deg, 10),
+            "rtklib_h_antenna_m": _fmt(s.h_m, 4),
+
+            "rtklib_std_h_m": _fmt(s.std_h_m),
+            "cors_std_up_m": _fmt(cors_std_u),
+            "uncertainty_note": "RSS of RTKLIB scatter and CORS PPP repeatability; antenna H/E/N measurement uncertainty not yet included.",
+            "qc_flags": "; ".join(s.qc_flags),
+        })
+
+    return records
+
+
+
 def build_report(
     inputs: UserInputs,
     cors: CorsSolution,
@@ -471,7 +807,7 @@ def build_report(
         "rinex_version": x.rinex_version,
         "first_obs": x.first_obs,
         "last_obs": x.last_obs,
-        "duration_minutes": x.duration_minutes,
+        "duration_minutes": _fmt(_rinex_duration_minutes(x), 4),
         "interval_sec": x.interval_sec,
         "receiver": x.receiver,
         "antenna": x.antenna,
@@ -483,7 +819,7 @@ def build_report(
         "rinex_version": x.rinex_version,
         "first_obs": x.first_obs,
         "last_obs": x.last_obs,
-        "duration_minutes": x.duration_minutes,
+        "duration_minutes": _fmt(_rinex_duration_minutes(x), 4),
         "interval_sec": x.interval_sec,
         "receiver": x.receiver,
         "antenna": x.antenna,
@@ -566,14 +902,42 @@ def build_report(
         "baseline_U_m": _fmt(s.baseline_U_m),
         "baseline_length_m": _fmt(s.baseline_length_m),
         "q1_fixed_percent": _fmt(s.q1_fixed_percent, 2),
+        "n_fixed_epochs_used": s.n_fixed_epochs_used,
+        "fixed_time_start": s.fixed_time_start,
+        "fixed_time_end": s.fixed_time_end,
+        "fixed_total_duration_min": _fmt(s.fixed_total_duration_min, 3),
+        "longest_fixed_segment_start": s.longest_fixed_segment_start,
+        "longest_fixed_segment_end": s.longest_fixed_segment_end,
+        "longest_fixed_segment_duration_min": _fmt(s.longest_fixed_segment_duration_min, 3),
+        "longest_fixed_segment_epochs": s.longest_fixed_segment_epochs,
         "ratio_mean": _fmt(s.ratio_mean, 2),
         "qc_flags": "; ".join(s.qc_flags),
     } for s in solutions]))
 
-    html_parts.append("<h2>13. Final GNSSBM coordinate solutions</h2>")
-    html_parts.append("<p>v0.1 reports per-run GNSSBM coordinate solutions. Benchmark-level weighted combination is a later extension.</p>")
+    html_parts.append("<h2>13. Q=1 fixed segment diagnostics</h2>")
+    segment_records = _fixed_segment_diagnostic_records(parsed_pos_items or [], solutions)
+    html_parts.append(_html_table_from_records([{
+        "run_label": r["run_label"],
+        "segment_id": r["segment_id"],
+        "segment_start": r["segment_start"],
+        "segment_end": r["segment_end"],
+        "duration_min": _fmt(r["duration_min"], 3),
+        "n_epochs": r["n_epochs"],
+        "mean_h_m": _fmt(r["mean_h_m"], 4),
+        "std_h_m": _fmt(r["std_h_m"], 4),
+        "delta_h_from_solution_mean_m": _fmt(r["delta_h_from_solution_mean_m"], 4),
+        "note": r["note"],
+    } for r in segment_records]))
 
-    html_parts.append("<h2>14. Warnings and rejected runs</h2>")
+    html_parts.append("<h2>14. Final GNSSBM coordinate solutions</h2>")
+    html_parts.append("<p>Final per-run GNSSBM coordinate solutions. The RTKLIB solution remains antenna-to-antenna. At report level, rover RINEX ANTENNA: DELTA H/E/N is applied as a full local ENU correction to convert antenna XYZ/lon/lat/h to BM XYZ/lon/lat/h. Coordinate standard deviations include RTKLIB per-run scatter and CORS PPP repeatability by RSS propagation. Antenna H/E/N measurement uncertainty is not yet included.</p>")
+    html_parts.append(_html_table_from_records(_final_gnssbm_solution_records(
+        cors=cors,
+        pairs=pairs,
+        solutions=solutions,
+    )))
+
+    html_parts.append("<h2>15. Warnings and rejected runs</h2>")
     warning_records = []
     for r in run_results:
         for w in r.warnings:
@@ -585,7 +949,7 @@ def build_report(
             warning_records.append({"run_label": s.run_label, "severity": "QC", "message": flag})
     html_parts.append(_html_table_from_records(warning_records))
 
-    html_parts.append("<h2>15. Plots</h2>")
+    html_parts.append("<h2>16. Plots</h2>")
     if inputs.generate_plots:
         if inputs.processing_mode == "static":
             html_parts.append("<h3>Static solution map</h3>")
@@ -596,7 +960,7 @@ def build_report(
     else:
         html_parts.append("<p>Plot generation disabled.</p>")
 
-    html_parts.append("<h2>16. Reproducibility appendix</h2>")
+    html_parts.append("<h2>17. Reproducibility appendix</h2>")
     html_parts.append(_html_table_from_records([{
         "run_label": r.run_label,
         "command_path": r.command_path,
