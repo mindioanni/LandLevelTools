@@ -60,9 +60,9 @@ It parses ANTEX files, extracts antenna and frequency information, produces summ
 
 ### `GINAN_PEA_PPP_timeseries_post_processor_v1_20260203.ipynb`
 
-Notebook for post-processing Ginan/PEA POS and TRACE outputs.
+Legacy PPP post-processing and audit notebook for Ginan/PEA POS and TRACE outputs.
 
-It discovers PPP sessions, attaches TRACE files, extracts embedded YAML processing strategies, performs strategy-consistency checks, parses POS files, generates statistics and plots, extracts optional TRACE-derived diagnostics, compares sessions, and finalizes an HTML report. It is useful for auditing and comparing PPP processing runs after Ginan/PEA execution.
+The current `GINAN_PEA_PPP_Batch_Processor/` package now covers the main operational workflow, including PPP execution, POS parsing, convergence analysis, time-series extraction, TRACE/QC flags, and HTML reporting. This notebook is retained temporarily because its strategy-consistency checks and cross-session comparison diagnostics have not yet been confirmed as fully migrated into the package.
 
 ### `Vertical_Component_error_V0_20260210.ipynb`
 
@@ -96,11 +96,11 @@ The workflow imports geospatial, outlier-detection, change-point, filtering, SQL
 
 ### `Seismicity_V8_15032025.ipynb`
 
-Newer seismicity-analysis notebook version retained as the preferred seismicity notebook.
+Current preferred seismicity-analysis notebook.
 
 ### `Seismicity_V7_11022025.ipynb`
 
-Older seismicity-analysis notebook version retained for reproducibility. It may be reviewed later and removed if all required functionality is confirmed to be superseded by `Seismicity_V8_15032025.ipynb`.
+Legacy seismicity-analysis notebook retained pending supersession review. Static audit showed that V7 still contains V7-only analytical cells, including seismic energy flow-rate diagrams, Gutenberg–Richter b-value analysis, and Modified Omori Law / seismic activity acceleration criterion logic. It should not be deleted until those elements are confirmed to be fully superseded by V8.
 
 ---
 
@@ -111,7 +111,6 @@ Older seismicity-analysis notebook version retained for reproducibility. It may 
 - `Adjust_Tide_Gauge_Datum_Network_V1.0.ipynb`
 - `GNSS_GEIN_NOA.ipynb`
 - `ANTEX_Comparisons_V1_20260219.ipynb`
-- `GINAN_PEA_PPP_timeseries_post_processor_v1_20260203.ipynb`
 - `Seismicity_V8_15032025.ipynb`
 
 ### Current active Python workflow packages
@@ -123,6 +122,7 @@ Older seismicity-analysis notebook version retained for reproducibility. It may 
 
 - `EGMS_shifts.ipynb`
 - `NOA TG datum map V1.ipynb`
+- `GINAN_PEA_PPP_timeseries_post_processor_v1_20260203.ipynb`
 - `Seismicity_V7_11022025.ipynb`
 - `Vertical_Component_error_V0_20260210.ipynb`
 
