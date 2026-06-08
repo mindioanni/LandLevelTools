@@ -438,7 +438,16 @@ def _stats(values: pd.Series) -> dict:
 
 def _add_stats(row: dict, df: pd.DataFrame, prefix: str, components: dict[str, str]) -> None:
     for out_name, col in components.items():
-        s = _stats(df[col])
+        if col in df.columns:
+            s = _stats(df[col])
+        else:
+            s = {
+                "std": np.nan,
+                "min": np.nan,
+                "max": np.nan,
+                "range": np.nan,
+            }
+
         row[f"{prefix}_std_{out_name}"] = s["std"]
         row[f"{prefix}_min_{out_name}"] = s["min"]
         row[f"{prefix}_max_{out_name}"] = s["max"]

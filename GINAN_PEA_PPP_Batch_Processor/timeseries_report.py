@@ -9,6 +9,7 @@ import math
 import re
 import sys
 import pandas as pd
+import numpy as np
 
 
 MODULE_DIR = Path(__file__).resolve().parent
@@ -1220,19 +1221,1836 @@ def _non_successful_datasets_html(failed_datasets: list[dict] | None = None) -> 
     return "\n".join(text)
 
 
-def _plot_html(df: pd.DataFrame, plot_columns=None, failed_datasets: list[dict] | None = None) -> str:
-    resolved = _resolve_plot_columns(plot_columns)
 
-    if not resolved:
-        return "<p>No plots requested.</p>"
+
+def _default_report_analysis_config() -> dict:
+    return {
+        "shift_detection": {
+            "enabled": True,
+            "min_series_days": 100.0,
+            "window_days": 28.0,
+            "step_days": 1.0,
+            "min_points_per_window": 10,
+            "mad_sigma_floor_m": 0.005,
+            "min_abs_jump_m": 0.005,
+            "min_jump_sigma": 3.0,
+            "min_model_improvement_percent": 20.0,
+            "min_confidence": 0.70,
+            "noise_method": "diff_mad",
+        },
+        "shift_clustering": {
+            "cluster_window_days": 14.0,
+            "min_components": 1,
+        },
+        "shift_report_selection": {
+            "min_confidence": 0.90,
+            "min_abs_jump_mm": 20.0,
+            "min_components": 1,
+        },
+        "meta_clustering": {
+            "enabled": True,
+            "max_gap_days": 14.0,
+            "enable_direction_similarity": True,
+            "direction_mode": "horizontal",
+            "max_direction_change_deg": 45.0,
+            "enable_magnitude_compatibility": False,
+            "max_magnitude_ratio": 3.0,
+        },
+        "velocity_windows": {
+            "min_points_per_window": 5,
+            "min_duration_days_for_stable_rate": 365.25,
+            "apply_gaussian_smoothing": True,
+            "gaussian_width_days": 28.0,
+            "outlier_rejection_enabled": True,
+            "sigma_floor_m": 0.001,
+        },
+        "rolling_velocity_diagnostics": {
+            "enabled": True,
+            "window_days": 182.0,
+            "step_days": 7.0,
+            "comparison_lag_days": 91.0,
+            "min_points_per_window": 20,
+            "apply_gaussian_smoothing": True,
+            "gaussian_width_days": 28.0,
+            "significance_z_threshold": 4.0,
+            "min_abs_delta_velocity_mm_per_year": 1.0,
+            "minimum_persistence_fraction_of_window": 0.5,
+            "horizontal_coherence_required": True,
+            "meta_association_window_days": None,
+            "include_horizontal_vector": True,
+        },
+        "plots": {
+            "show_gaussian_smoothed_enu": True,
+            "gaussian_width_days": 28.0,
+            "velocity_segment_plot_mode": 1,
+        },
+    }
+
+
+def _resolve_report_analysis_config(report_analysis_config: dict | None = None) -> dict:
+    cfg = _default_report_analysis_config()
+
+    if not report_analysis_config:
+        return cfg
+
+    if not isinstance(report_analysis_config, dict):
+        return cfg
+
+    for section, values in report_analysis_config.items():
+        if section not in cfg or not isinstance(values, dict):
+            continue
+
+        for key, value in values.items():
+            if key in cfg[section]:
+                cfg[section][key] = value
+
+    # Keep plot smoothing width aligned with velocity smoothing width unless
+    # explicitly supplied under plots.
+    if "plots" not in report_analysis_config or "gaussian_width_days" not in report_analysis_config.get("plots", {}):
+        cfg["plots"]["gaussian_width_days"] = cfg["velocity_windows"]["gaussian_width_days"]
+
+    return cfg
+
+def _compute_report_shift_clusters(df: pd.DataFrame, report_analysis_config: dict | None = None) -> pd.DataFrame:
+    try:
+        import timeseries_change_detection as tcd
+    except Exception:
+        return pd.DataFrame()
+
+    required = ["time_mean_all_epochs_utc", "E_m", "N_m", "U_m"]
+    if any(col not in df.columns for col in required):
+        return pd.DataFrame()
+
+    analysis_cfg = _resolve_report_analysis_config(report_analysis_config)
+    shift_cfg = analysis_cfg["shift_detection"]
+    cluster_cfg = analysis_cfg["shift_clustering"]
+    selection_cfg = analysis_cfg["shift_report_selection"]
+
+    if not bool(shift_cfg.get("enabled", True)):
+        return pd.DataFrame()
+
+    cfg = tcd.ShiftDetectionConfig(
+        columns=("E_m", "N_m", "U_m"),
+        min_series_days=float(shift_cfg["min_series_days"]),
+        window_days=float(shift_cfg["window_days"]),
+        step_days=float(shift_cfg["step_days"]),
+        min_points_per_window=int(shift_cfg["min_points_per_window"]),
+        mad_sigma_floor_m=float(shift_cfg["mad_sigma_floor_m"]),
+        min_abs_jump_m=float(shift_cfg["min_abs_jump_m"]),
+        min_jump_sigma=float(shift_cfg["min_jump_sigma"]),
+        min_model_improvement_percent=float(shift_cfg["min_model_improvement_percent"]),
+        min_confidence=float(shift_cfg["min_confidence"]),
+        noise_method=str(shift_cfg["noise_method"]),
+    )
+
+    events = tcd.detect_shifts(df, cfg)
+    clusters = tcd.cluster_shift_events(
+        events,
+        cluster_window_days=float(cluster_cfg["cluster_window_days"]),
+        min_components=int(cluster_cfg["min_components"]),
+    )
+
+    selected = tcd.select_report_shift_clusters(
+        clusters,
+        min_confidence=float(selection_cfg["min_confidence"]),
+        min_abs_jump_mm=float(selection_cfg["min_abs_jump_mm"]),
+        min_components=int(selection_cfg["min_components"]),
+    )
+
+    if selected is None or len(selected) == 0 or events is None or len(events) == 0:
+        return selected
+
+    selected = selected.copy()
+    selected.attrs["report_analysis_config"] = analysis_cfg
+    selected.attrs["total_accepted_shift_candidates"] = int(len(events))
+    selected.attrs["total_report_cluster_candidates"] = int(selected["n_candidates"].sum()) if "n_candidates" in selected.columns else 0
+    selected.attrs["total_report_clusters"] = int(len(selected))
+
+    candidate_decimal_years = []
+    candidate_utc_times = []
+    candidate_counts = []
+
+    work_events = events.copy()
+    work_events["decimal_year"] = pd.to_numeric(work_events["decimal_year"], errors="coerce")
+
+    for _, cluster in selected.iterrows():
+        try:
+            start_dec = float(cluster.get("cluster_start_decimal_year", math.nan))
+            end_dec = float(cluster.get("cluster_end_decimal_year", math.nan))
+        except Exception:
+            start_dec = math.nan
+            end_dec = math.nan
+
+        components_text = str(cluster.get("components", ""))
+        components = [item.strip() for item in components_text.split(",") if item.strip()]
+
+        mask = pd.Series(True, index=work_events.index)
+
+        if math.isfinite(start_dec) and math.isfinite(end_dec):
+            lo = min(start_dec, end_dec)
+            hi = max(start_dec, end_dec)
+            mask = mask & (work_events["decimal_year"] >= lo) & (work_events["decimal_year"] <= hi)
+
+        if components:
+            mask = mask & work_events["component"].astype(str).isin(components)
+
+        candidates = work_events.loc[mask].sort_values("decimal_year")
+
+        dec_values = []
+        utc_values = []
+
+        for _, candidate in candidates.iterrows():
+            try:
+                dec = float(candidate.get("decimal_year", math.nan))
+            except Exception:
+                dec = math.nan
+
+            if math.isfinite(dec):
+                dec_values.append(dec)
+                utc_values.append(str(candidate.get("time_utc", "")))
+
+        candidate_decimal_years.append(",".join(f"{value:.4f}" for value in dec_values))
+        candidate_utc_times.append(",".join(utc_values))
+        candidate_counts.append(len(dec_values))
+
+    selected["candidate_decimal_years"] = candidate_decimal_years
+    selected["candidate_utc_times"] = candidate_utc_times
+    selected["candidate_count"] = candidate_counts
+
+    return selected
+
+
+
+def _shift_cluster_duration_days(item) -> float:
+    try:
+        start = float(item.get("cluster_start_decimal_year", math.nan))
+        end = float(item.get("cluster_end_decimal_year", math.nan))
+    except Exception:
+        return math.nan
+
+    if not math.isfinite(start) or not math.isfinite(end):
+        return math.nan
+
+    return abs(end - start) * 365.25
+
+
+def _shift_cluster_event_class(item) -> str:
+    try:
+        n_candidates = int(item.get("n_candidates", 0))
+    except Exception:
+        n_candidates = 0
+
+    duration_days = _shift_cluster_duration_days(item)
+
+    if n_candidates <= 1 or (math.isfinite(duration_days) and duration_days <= 1.0):
+        return "single-candidate shift"
+
+    if math.isfinite(duration_days) and duration_days <= 30.0:
+        return "localized shift cluster"
+
+    return "extended transition cluster"
+
+def _shift_clusters_html(clusters: pd.DataFrame) -> str:
+    text = []
+
+    text.append(
+        "<p>Report-grade shift detection is based on robust windowed step detection, "
+        "first-difference MAD noise estimation, temporal clustering of adjacent candidates, "
+        "and conservative report filtering. Current fixed V1 strict-cluster report thresholds are: <code>window_days = 28</code>, <code>strict_cluster_window_days = 14</code>, <code>mad_sigma_floor = 5 mm</code>, <code>min_abs_jump = 5 mm</code>, <code>min_jump_sigma = 3</code>, <code>min_model_improvement_percent = 20</code>, <code>min_report_confidence = 0.90</code>, and <code>min_report_abs_jump = 20 mm</code>.</p>"
+    )
+
+    total_candidates = ""
+    report_cluster_candidates = ""
+    report_clusters = ""
+
+    if clusters is not None:
+        total_candidates = clusters.attrs.get("total_accepted_shift_candidates", "")
+        report_cluster_candidates = clusters.attrs.get("total_report_cluster_candidates", "")
+        report_clusters = clusters.attrs.get("total_report_clusters", len(clusters))
+
+    text.append(
+        "<p>With the current detector settings, the shift detector identified "
+        f"<strong>{_html_escape(total_candidates)}</strong> accepted shift candidates in total. "
+        f"Of these, <strong>{_html_escape(report_cluster_candidates)}</strong> candidates belong to the "
+        f"report-grade strict clusters shown in the table below, corresponding to "
+        f"<strong>{_html_escape(report_clusters)}</strong> internal cluster ID(s).</p>"
+    )
+
+    if clusters is None or len(clusters) == 0:
+        text.append("<p>No report-grade shift clusters were detected.</p>")
+        return chr(10).join(text)
+
+    rows = []
+
+    for report_event_id, (_, item) in enumerate(clusters.iterrows(), start=1):
+        duration_days = _shift_cluster_duration_days(item)
+        event_class = _shift_cluster_event_class(item)
+
+        rows.append([
+            _html_escape(report_event_id),
+            _html_escape(item.get("cluster_id", "")),
+            _html_escape(event_class),
+            _html_escape(_fmt(item.get("representative_decimal_year", math.nan), digits=4)),
+            _html_escape(item.get("representative_time_utc", "")),
+            _html_escape(_fmt(item.get("cluster_start_decimal_year", math.nan), digits=4)),
+            _html_escape(_fmt(item.get("cluster_end_decimal_year", math.nan), digits=4)),
+            _html_escape(_fmt(duration_days, digits=1)),
+            _html_escape(item.get("components", "")),
+            _html_escape(item.get("n_candidates", "")),
+            _html_escape(item.get("candidate_count", "")),
+            _html_escape(item.get("n_components", "")),
+            _html_escape(_fmt(item.get("max_abs_jump_mm", math.nan), digits=3)),
+            _html_escape(_fmt(item.get("max_jump_sigma", math.nan), digits=3)),
+            _html_escape(_fmt(item.get("max_model_improvement_percent", math.nan), digits=2)),
+            _html_escape(_fmt(item.get("max_confidence", math.nan), digits=3)),
+            _html_escape(_fmt(item.get("E_jump_mm", math.nan), digits=3)),
+            _html_escape(_fmt(item.get("N_jump_mm", math.nan), digits=3)),
+            _html_escape(_fmt(item.get("U_jump_mm", math.nan), digits=3)),
+        ])
+
+    text.append(_html_table(
+        [
+            "Report event",
+            "Internal cluster ID",
+            "Event class",
+            "Representative decimal year",
+            "Representative UTC",
+            "Cluster start decimal year",
+            "Cluster end decimal year",
+            "Cluster duration (days)",
+            "Components",
+            "Cluster candidates",
+            "Annotated candidates",
+            "Component count",
+            "Max abs jump (mm)",
+            "Max jump sigma",
+            "Max model improvement (%)",
+            "Max confidence",
+            "E jump (mm)",
+            "N jump (mm)",
+            "U jump (mm)",
+        ],
+        rows,
+    ))
+
+    text.append(
+        "<p>In the full-span ENU plots, light grey shaded intervals indicate the temporal span "
+        "of each report-grade strict cluster, and red dashed vertical lines indicate the "
+        "representative epoch of each cluster. Accepted shift-candidate epochs are not shown "
+        "in the full-span plots; they are shown only in the shift-cluster zoom plots.</p>"
+    )
+
+    return chr(10).join(text)
+
+
+def _velocity_uncertainty_mm_per_year_for_window(
+    sigma_m,
+    x_window: pd.Series,
+    series_used_for_fit: str,
+) -> float:
+    if str(series_used_for_fit) == "meta_cluster_net_jump":
+        return math.nan
+
+    try:
+        sigma_m = float(sigma_m)
+    except Exception:
+        return math.nan
+
+    if not math.isfinite(sigma_m):
+        return math.nan
+
+    x_values = pd.to_numeric(x_window, errors="coerce").dropna()
+
+    if len(x_values) < 3:
+        return math.nan
+
+    x_mean = float(x_values.mean())
+    sxx = float(((x_values - x_mean) ** 2).sum())
+
+    if not math.isfinite(sxx) or sxx <= 0:
+        return math.nan
+
+    return 1000.0 * sigma_m / math.sqrt(sxx)
+
+
+def _draw_velocity_trends_on_fullspan_axis(
+    ax,
+    df: pd.DataFrame,
+    column: str,
+    x_series: pd.Series,
+    velocity_windows: pd.DataFrame | None,
+) -> bool:
+    if velocity_windows is None or len(velocity_windows) == 0:
+        return False
+
+    if column not in {"E_m", "N_m", "U_m"}:
+        return False
+
+    if column not in df.columns:
+        return False
+
+    work = velocity_windows.copy()
+
+    if "component" not in work.columns:
+        return False
+
+    work = work[work["component"].astype(str) == column].copy()
+
+    if len(work) == 0:
+        return False
+
+    required = [
+        "start_decimal_year",
+        "end_decimal_year",
+        "velocity_mm_per_year",
+        "window_label",
+        "rate_class",
+        "series_used_for_fit",
+        "sigma_m",
+    ]
+
+    missing = [item for item in required if item not in work.columns]
+    if missing:
+        return False
+
+    y_all = pd.to_numeric(df[column], errors="coerce")
+    y_finite = y_all.dropna()
+
+    if len(y_finite) > 0:
+        y_span = float(y_finite.max() - y_finite.min())
+    else:
+        y_span = 0.0
+
+    if not math.isfinite(y_span) or y_span <= 0:
+        y_span = 0.01
+
+    plotted_any = False
+
+    sort_order = {
+        "before_meta_cluster": 0,
+        "during_meta_cluster": 1,
+        "after_meta_cluster": 2,
+    }
+
+    work["_sort_order"] = work["window_label"].astype(str).map(sort_order).fillna(99)
+    work = work.sort_values(["_sort_order", "start_decimal_year", "end_decimal_year"])
+
+    for idx, (_, item) in enumerate(work.iterrows()):
+        try:
+            x0 = float(item.get("start_decimal_year", math.nan))
+            x1 = float(item.get("end_decimal_year", math.nan))
+            velocity_mm_per_year = float(item.get("velocity_mm_per_year", math.nan))
+        except Exception:
+            continue
+
+        if not math.isfinite(x0) or not math.isfinite(x1) or not math.isfinite(velocity_mm_per_year):
+            continue
+
+        if x1 <= x0:
+            continue
+
+        mask = (x_series >= x0) & (x_series <= x1)
+        x_window = x_series.loc[mask]
+        y_window = y_all.loc[mask].dropna()
+
+        if len(x_window.dropna()) < 2 or len(y_window) == 0:
+            continue
+
+        x_mid = float(pd.to_numeric(x_window, errors="coerce").dropna().median())
+        y_anchor = float(y_window.median())
+
+        slope_m_per_year = velocity_mm_per_year / 1000.0
+
+        y0 = y_anchor + slope_m_per_year * (x0 - x_mid)
+        y1 = y_anchor + slope_m_per_year * (x1 - x_mid)
+
+        label = "velocity trend" if not plotted_any else None
+
+        ax.plot(
+            [x0, x1],
+            [y0, y1],
+            color="green",
+            linewidth=1.4,
+            alpha=0.95,
+            label=label,
+            zorder=4,
+        )
+
+        sigma_v = _velocity_uncertainty_mm_per_year_for_window(
+            item.get("sigma_m", math.nan),
+            x_window,
+            item.get("series_used_for_fit", ""),
+        )
+
+        if math.isfinite(sigma_v):
+            sigma_text = f"{sigma_v:.1f}"
+        else:
+            sigma_text = "n/a"
+
+        window_label = str(item.get("window_label", ""))
+        rate_class = str(item.get("rate_class", ""))
+
+        if window_label == "before_meta_cluster":
+            prefix = "before"
+        elif window_label == "during_meta_cluster":
+            prefix = "during"
+        elif window_label == "after_meta_cluster":
+            prefix = "after"
+        else:
+            prefix = window_label
+
+        text_y = y_anchor + ((idx % 3) - 1) * 0.035 * y_span
+
+        ax.text(
+            x_mid,
+            text_y,
+            f"{prefix}: {velocity_mm_per_year:+.1f} ± {sigma_text} mm yr⁻¹",
+            color="black",
+            fontsize=6,
+            ha="center",
+            va="bottom",
+            bbox={
+                "facecolor": "white",
+                "edgecolor": "none",
+                "alpha": 0.65,
+                "pad": 1.5,
+            },
+            zorder=5,
+        )
+
+        plotted_any = True
+
+    return plotted_any
+
+
+def _gaussian_smoothed_enu_series_for_plot(
+    df: pd.DataFrame,
+    column: str,
+    x_series: pd.Series,
+    gaussian_width_days: float = 28.0,
+) -> pd.Series | None:
+    if column not in {"E_m", "N_m", "U_m"}:
+        return None
+
+    if column not in df.columns:
+        return None
+
+    try:
+        import timeseries_velocity_detection as tvd
+    except Exception:
+        return None
+
+    required_helpers = [
+        "MetaClusterVelocityWindowConfig",
+        "_pre_smoothing_outlier_mask",
+        "_gaussian_smooth_by_decimal_year",
+    ]
+
+    if any(not hasattr(tvd, name) for name in required_helpers):
+        return None
+
+    y_raw = pd.to_numeric(df[column], errors="coerce")
+    valid = x_series.notna() & y_raw.notna()
+
+    if valid.sum() < 3:
+        return None
+
+    x = pd.to_numeric(x_series.loc[valid], errors="coerce").to_numpy(dtype=float)
+    y = y_raw.loc[valid].to_numpy(dtype=float)
+
+    cfg = tvd.MetaClusterVelocityWindowConfig(
+        columns=(column,),
+        min_points_per_window=5,
+        min_duration_days_for_stable_rate=365.25,
+        apply_gaussian_smoothing=True,
+        gaussian_width_days=float(gaussian_width_days),
+        outlier_rejection_enabled=True,
+        sigma_floor_m=0.001,
+    )
+
+    try:
+        keep = tvd._pre_smoothing_outlier_mask(x, y, cfg)
+        y_smooth = tvd._gaussian_smooth_by_decimal_year(
+            x=x,
+            y=y,
+            valid_mask=keep,
+            gaussian_width_days=float(gaussian_width_days),
+        )
+    except Exception:
+        return None
+
+    out = pd.Series(index=df.index, dtype="float64")
+    out.loc[valid] = y_smooth
+
+    return out
+
+
+def _decimal_year_series_for_composite_plot(df: pd.DataFrame) -> tuple[pd.Series, str]:
+    if "decimal_year" in df.columns:
+        x = pd.to_numeric(df["decimal_year"], errors="coerce")
+        return pd.Series(x, index=df.index, dtype="float64"), "decimal year"
+
+    time_candidates = [
+        "time_mean_all_epochs_utc",
+        "time_utc",
+        "datetime_utc",
+        "time",
+    ]
+
+    for col in time_candidates:
+        if col not in df.columns:
+            continue
+
+        t = pd.to_datetime(df[col], errors="coerce", utc=True)
+
+        if t.notna().sum() == 0:
+            continue
+
+        dec = []
+        for item in t:
+            if pd.isna(item):
+                dec.append(math.nan)
+                continue
+
+            start = pd.Timestamp(year=int(item.year), month=1, day=1, tz="UTC")
+            end = pd.Timestamp(year=int(item.year) + 1, month=1, day=1, tz="UTC")
+            value = int(item.year) + (item - start).total_seconds() / (end - start).total_seconds()
+            dec.append(float(value))
+
+        return pd.Series(dec, index=df.index, dtype="float64"), "decimal year"
+
+    x = pd.Series(range(len(df)), index=df.index, dtype="float64")
+    return x, "index"
+
+
+def _add_external_legend(fig, axes) -> None:
+    if axes is None:
+        return
+
+    if hasattr(axes, "ravel"):
+        axes_list = list(axes.ravel())
+    elif isinstance(axes, (list, tuple)):
+        axes_list = []
+        for item in axes:
+            if hasattr(item, "ravel"):
+                axes_list.extend(list(item.ravel()))
+            elif isinstance(item, (list, tuple)):
+                axes_list.extend(item)
+            else:
+                axes_list.append(item)
+    else:
+        axes_list = [axes]
+
+    handles = []
+    labels = []
+
+    for ax in axes_list:
+        if not hasattr(ax, "get_legend_handles_labels"):
+            continue
+
+        h, l = ax.get_legend_handles_labels()
+
+        for handle, label in zip(h, l):
+            if label and label not in labels:
+                handles.append(handle)
+                labels.append(label)
+
+    if not handles:
+        return
+
+    fig.legend(
+        handles,
+        labels,
+        loc="upper left",
+        bbox_to_anchor=(0.82, 0.98),
+        borderaxespad=0.0,
+        fontsize=8,
+    )
+
+
+
+def _select_velocity_change_segments_for_plot(
+    velocity_change_diagnostics: dict | None,
+    report_analysis_config: dict | None = None,
+) -> pd.DataFrame:
+    if velocity_change_diagnostics is None:
+        return pd.DataFrame()
+
+    classified = velocity_change_diagnostics.get("classified", pd.DataFrame())
+
+    if classified is None or len(classified) == 0:
+        return pd.DataFrame()
+
+    analysis_cfg = _resolve_report_analysis_config(report_analysis_config)
+    plot_cfg = analysis_cfg.get("plots", {})
+
+    try:
+        mode = int(plot_cfg.get("velocity_segment_plot_mode", 1))
+    except Exception:
+        mode = 1
+
+    work = classified.copy()
+
+    if "component" not in work.columns:
+        return pd.DataFrame()
+
+    if mode == 1:
+        # Shift-related report-grade horizontal velocity-change segments only.
+        required_cols = {"report_grade", "shift_related_velocity_change", "component"}
+        if not required_cols.issubset(set(work.columns)):
+            return pd.DataFrame()
+
+        work = work[
+            (work["report_grade"] == True)
+            & (work["shift_related_velocity_change"] == True)
+            & (work["component"].astype(str) == "H_magnitude")
+        ].copy()
+
+    elif mode == 2:
+        # All report-grade horizontal velocity-change segments.
+        required_cols = {"report_grade", "component"}
+        if not required_cols.issubset(set(work.columns)):
+            return pd.DataFrame()
+
+        work = work[
+            (work["report_grade"] == True)
+            & (work["component"].astype(str) == "H_magnitude")
+        ].copy()
+
+    elif mode == 3:
+        # All persistent horizontal velocity-change segments.
+        work = work[work["component"].astype(str).isin(["H_magnitude", "E_m", "N_m"])].copy()
+
+    elif mode == 4:
+        # All persistent velocity-change segments including vertical diagnostic-only.
+        work = work.copy()
+
+    else:
+        work = work[
+            (work.get("report_grade", False) == True)
+            & (work.get("shift_related_velocity_change", False) == True)
+            & (work["component"].astype(str) == "H_magnitude")
+        ].copy()
+
+    if len(work) == 0:
+        return pd.DataFrame()
+
+    for col in [
+        "cluster_start_decimal_year",
+        "cluster_end_decimal_year",
+        "representative_center_decimal_year",
+        "representative_delta_velocity_mm_per_year",
+        "max_velocity_change_z",
+    ]:
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce")
+
+    work = work.dropna(subset=["cluster_start_decimal_year", "cluster_end_decimal_year"])
+
+    return work.sort_values(["cluster_start_decimal_year", "cluster_end_decimal_year"]).reset_index(drop=True)
+
+
+def _local_fit_velocity_segment_for_component(
+    df: pd.DataFrame,
+    column: str,
+    x_series: pd.Series,
+    x0: float,
+    x1: float,
+    gaussian_width_days: float,
+) -> dict | None:
+    if column not in df.columns:
+        return None
+
+    if not math.isfinite(x0) or not math.isfinite(x1) or x1 <= x0:
+        return None
+
+    y_series = _gaussian_smoothed_enu_series_for_plot(
+        df=df,
+        column=column,
+        x_series=x_series,
+        gaussian_width_days=gaussian_width_days,
+    )
+
+    if y_series is None:
+        y_series = pd.to_numeric(df[column], errors="coerce")
+
+    x = pd.to_numeric(x_series, errors="coerce")
+    y = pd.to_numeric(y_series, errors="coerce")
+
+    mask = (x >= x0) & (x <= x1) & x.notna() & y.notna()
+
+    xw = x.loc[mask].to_numpy(dtype=float)
+    yw = y.loc[mask].to_numpy(dtype=float)
+
+    if len(xw) < 3:
+        return None
+
+    try:
+        coeff = np.polyfit(xw, yw, deg=1)
+    except Exception:
+        return None
+
+    slope_m_per_year = float(coeff[0])
+    intercept = float(coeff[1])
+
+    y_fit = slope_m_per_year * xw + intercept
+    residuals = yw - y_fit
+
+    dof = max(1, len(xw) - 2)
+    sigma_m = float(np.sqrt(np.sum(residuals ** 2) / dof))
+
+    x_mean = float(np.mean(xw))
+    sxx = float(np.sum((xw - x_mean) ** 2))
+
+    if sxx > 0 and math.isfinite(sigma_m):
+        sigma_velocity_mm_per_year = 1000.0 * sigma_m / math.sqrt(sxx)
+    else:
+        sigma_velocity_mm_per_year = math.nan
+
+    return {
+        "x0": float(x0),
+        "x1": float(x1),
+        "y0": float(slope_m_per_year * x0 + intercept),
+        "y1": float(slope_m_per_year * x1 + intercept),
+        "x_mid": float(0.5 * (x0 + x1)),
+        "y_mid": float(slope_m_per_year * (0.5 * (x0 + x1)) + intercept),
+        "velocity_mm_per_year": 1000.0 * slope_m_per_year,
+        "sigma_velocity_mm_per_year": sigma_velocity_mm_per_year,
+        "n_points": int(len(xw)),
+    }
+
+
+def _draw_velocity_change_segments_on_enu_axis(
+    ax,
+    df: pd.DataFrame,
+    column: str,
+    x_series: pd.Series,
+    selected_segments: pd.DataFrame | None,
+    gaussian_width_days: float,
+) -> bool:
+    if selected_segments is None or len(selected_segments) == 0:
+        return False
+
+    if column not in {"E_m", "N_m", "U_m"}:
+        return False
+
+    plotted_any = False
+
+    y_all = pd.to_numeric(df[column], errors="coerce")
+    y_finite = y_all.dropna()
+
+    if len(y_finite) > 0:
+        y_span = float(y_finite.max() - y_finite.min())
+    else:
+        y_span = 0.0
+
+    if not math.isfinite(y_span) or y_span <= 0:
+        y_span = 0.01
+
+    for idx, (_, segment) in enumerate(selected_segments.iterrows()):
+        try:
+            x0 = float(segment.get("cluster_start_decimal_year", math.nan))
+            x1 = float(segment.get("cluster_end_decimal_year", math.nan))
+        except Exception:
+            continue
+
+        fit = _local_fit_velocity_segment_for_component(
+            df=df,
+            column=column,
+            x_series=x_series,
+            x0=x0,
+            x1=x1,
+            gaussian_width_days=gaussian_width_days,
+        )
+
+        if fit is None:
+            continue
+
+        label = "velocity-change segment trend" if not plotted_any else None
+
+        ax.plot(
+            [fit["x0"], fit["x1"]],
+            [fit["y0"], fit["y1"]],
+            color="green",
+            linewidth=1.5,
+            alpha=0.95,
+            label=label,
+            zorder=4,
+        )
+
+        sigma_v = fit["sigma_velocity_mm_per_year"]
+
+        if math.isfinite(sigma_v):
+            sigma_text = f"{sigma_v:.1f}"
+        else:
+            sigma_text = "n/a"
+
+        try:
+            max_z = float(segment.get("max_velocity_change_z", math.nan))
+        except Exception:
+            max_z = math.nan
+
+        z_text = f", Z={max_z:.1f}" if math.isfinite(max_z) else ""
+
+        text_y = fit["y_mid"] + ((idx % 3) - 1) * 0.035 * y_span
+
+        ax.text(
+            fit["x_mid"],
+            text_y,
+            f"v: {fit['velocity_mm_per_year']:+.1f} ± {sigma_text} mm yr⁻¹{z_text}",
+            color="black",
+            fontsize=6,
+            ha="center",
+            va="bottom",
+            bbox={
+                "facecolor": "white",
+                "edgecolor": "none",
+                "alpha": 0.65,
+                "pad": 1.5,
+            },
+            zorder=5,
+        )
+
+        plotted_any = True
+
+    return plotted_any
+
+
+def _transient_windows_from_velocity_diagnostics(
+    velocity_change_diagnostics: dict | None,
+) -> pd.DataFrame:
+    if velocity_change_diagnostics is None:
+        return pd.DataFrame()
+
+    value = velocity_change_diagnostics.get("transient_windows", pd.DataFrame())
+
+    if value is None or len(value) == 0:
+        return pd.DataFrame()
+
+    return value.copy()
+
+
+def _component_transient_fits_from_velocity_diagnostics(
+    velocity_change_diagnostics: dict | None,
+) -> pd.DataFrame:
+    if velocity_change_diagnostics is None:
+        return pd.DataFrame()
+
+    value = velocity_change_diagnostics.get("transient_model_fits", pd.DataFrame())
+
+    if value is None or len(value) == 0:
+        return pd.DataFrame()
+
+    return value.copy()
+
+
+def _joint_horizontal_transient_fits_from_velocity_diagnostics(
+    velocity_change_diagnostics: dict | None,
+) -> pd.DataFrame:
+    if velocity_change_diagnostics is None:
+        return pd.DataFrame()
+
+    value = velocity_change_diagnostics.get("joint_horizontal_transient_model_fits", pd.DataFrame())
+
+    if value is None or len(value) == 0:
+        return pd.DataFrame()
+
+    return value.copy()
+
+
+def _clean_transient_windows_for_plot(transient_windows: pd.DataFrame) -> pd.DataFrame:
+    if transient_windows is None or len(transient_windows) == 0:
+        return pd.DataFrame()
+
+    required = {"window_type", "start_decimal_year", "end_decimal_year"}
+
+    if not required.issubset(set(transient_windows.columns)):
+        return pd.DataFrame()
+
+    out = transient_windows.copy()
+    out["start_decimal_year"] = pd.to_numeric(out["start_decimal_year"], errors="coerce")
+    out["end_decimal_year"] = pd.to_numeric(out["end_decimal_year"], errors="coerce")
+
+    out = out[
+        out["start_decimal_year"].notna()
+        & out["end_decimal_year"].notna()
+        & (out["end_decimal_year"] > out["start_decimal_year"])
+    ].copy()
+
+    return out.reset_index(drop=True)
+
+
+def _stable_intervals_outside_transient_windows(
+    x_series: pd.Series,
+    transient_windows: pd.DataFrame,
+) -> list[tuple[float, float]]:
+    x = pd.to_numeric(x_series, errors="coerce").dropna()
+
+    if len(x) == 0:
+        return []
+
+    x_min = float(x.min())
+    x_max = float(x.max())
+
+    tw = _clean_transient_windows_for_plot(transient_windows)
+
+    if tw.empty:
+        return [(x_min, x_max)]
+
+    intervals = []
+
+    for _, item in tw.iterrows():
+        intervals.append((
+            float(item["start_decimal_year"]),
+            float(item["end_decimal_year"]),
+        ))
+
+    intervals.sort(key=lambda item: item[0])
+
+    merged = []
+
+    for start, end in intervals:
+        if not merged:
+            merged.append([start, end])
+            continue
+
+        if start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
+    stable = []
+    cursor = x_min
+
+    for start, end in merged:
+        if start > cursor:
+            stable.append((cursor, start))
+        cursor = max(cursor, end)
+
+    if cursor < x_max:
+        stable.append((cursor, x_max))
+
+    return [
+        (float(start), float(end))
+        for start, end in stable
+        if math.isfinite(start) and math.isfinite(end) and end > start
+    ]
+
+
+def _fit_linear_curve_for_enu_plot(
+    df: pd.DataFrame,
+    x_series: pd.Series,
+    column: str,
+    start_decimal_year: float,
+    end_decimal_year: float,
+    gaussian_width_days: float,
+    min_points: int = 20,
+) -> dict | None:
+    if column not in df.columns:
+        return None
+
+    if not math.isfinite(start_decimal_year) or not math.isfinite(end_decimal_year):
+        return None
+
+    if end_decimal_year <= start_decimal_year:
+        return None
+
+    y_smooth = _gaussian_smoothed_enu_series_for_plot(
+        df=df,
+        column=column,
+        x_series=x_series,
+        gaussian_width_days=gaussian_width_days,
+    )
+
+    if y_smooth is None:
+        return None
+
+    x = pd.to_numeric(x_series, errors="coerce")
+    y = pd.to_numeric(y_smooth, errors="coerce")
+
+    mask = (
+        x.notna()
+        & y.notna()
+        & (x >= start_decimal_year)
+        & (x <= end_decimal_year)
+    )
+
+    if int(mask.sum()) < int(min_points):
+        return None
+
+    x_fit = x.loc[mask].to_numpy(dtype=float)
+    y_fit = y.loc[mask].to_numpy(dtype=float)
+
+    try:
+        coeff = np.polyfit(x_fit, y_fit, deg=1)
+    except Exception:
+        return None
+
+    y_hat = np.polyval(coeff, x_fit)
+
+    return {
+        "x": x_fit,
+        "y": y_hat,
+        "slope_m_per_year": float(coeff[0]),
+        "intercept_m": float(coeff[1]),
+        "n_points": int(len(x_fit)),
+    }
+
+
+def _select_joint_quadratic_fit_for_window(
+    joint_fits: pd.DataFrame,
+    window: pd.Series,
+) -> dict | None:
+    if joint_fits is None or len(joint_fits) == 0:
+        return None
+
+    required = {"window_type", "model_name"}
+
+    if not required.issubset(set(joint_fits.columns)):
+        return None
+
+    rows = joint_fits[
+        (joint_fits["window_type"].astype(str) == str(window.get("window_type", "")))
+        & (joint_fits["model_name"].astype(str) == "quadratic")
+    ].copy()
+
+    if "meta_cluster_id" in joint_fits.columns and "meta_cluster_id" in window.index:
+        rows = rows[
+            rows["meta_cluster_id"].astype(str)
+            == str(window.get("meta_cluster_id", ""))
+        ].copy()
+
+    if rows.empty:
+        return None
+
+    if "best_by_bic" in rows.columns and rows["best_by_bic"].fillna(False).any():
+        rows = rows[rows["best_by_bic"].fillna(False)].copy()
+
+    return rows.iloc[0].to_dict()
+
+
+def _select_component_quadratic_fit_for_window(
+    component_fits: pd.DataFrame,
+    window: pd.Series,
+    component: str,
+) -> dict | None:
+    if component_fits is None or len(component_fits) == 0:
+        return None
+
+    required = {"window_type", "component", "model_name"}
+
+    if not required.issubset(set(component_fits.columns)):
+        return None
+
+    rows = component_fits[
+        (component_fits["window_type"].astype(str) == str(window.get("window_type", "")))
+        & (component_fits["component"].astype(str) == str(component))
+        & (component_fits["model_name"].astype(str) == "quadratic")
+    ].copy()
+
+    if "meta_cluster_id" in component_fits.columns and "meta_cluster_id" in window.index:
+        rows = rows[
+            rows["meta_cluster_id"].astype(str)
+            == str(window.get("meta_cluster_id", ""))
+        ].copy()
+
+    if rows.empty:
+        return None
+
+    if "best_by_bic" in rows.columns and rows["best_by_bic"].fillna(False).any():
+        rows = rows[rows["best_by_bic"].fillna(False)].copy()
+
+    return rows.iloc[0].to_dict()
+
+
+def _quadratic_curve_from_fit_row(
+    x_values: np.ndarray,
+    start_decimal_year: float,
+    fit_row: dict,
+    column: str,
+) -> np.ndarray | None:
+    t_days = (x_values - float(start_decimal_year)) * 365.25
+
+    if column in {"E_m", "N_m"}:
+        prefix = "E" if column == "E_m" else "N"
+
+        intercept_key = f"{prefix}_intercept_mm"
+        linear_key = f"{prefix}_linear_mm_per_day"
+        quadratic_key = f"{prefix}_quadratic_mm_per_day2"
+
+        if not all(key in fit_row for key in [intercept_key, linear_key, quadratic_key]):
+            return None
+
+        intercept_mm = float(fit_row[intercept_key])
+        linear_mm_per_day = float(fit_row[linear_key])
+        quadratic_mm_per_day2 = float(fit_row[quadratic_key])
+
+    else:
+        if not all(key in fit_row for key in ["intercept_mm", "linear_mm_per_day", "quadratic_mm_per_day2"]):
+            return None
+
+        intercept_mm = float(fit_row["intercept_mm"])
+        linear_mm_per_day = float(fit_row["linear_mm_per_day"])
+        quadratic_mm_per_day2 = float(fit_row["quadratic_mm_per_day2"])
+
+    y_mm = (
+        intercept_mm
+        + linear_mm_per_day * t_days
+        + quadratic_mm_per_day2 * (t_days ** 2)
+    )
+
+    return y_mm / 1000.0
+
+
+
+def _velocity_label_from_smoothed_polynomial_fit(
+    df: pd.DataFrame,
+    x_series: pd.Series,
+    column: str,
+    start_decimal_year: float,
+    end_decimal_year: float,
+    gaussian_width_days: float,
+    degree: int,
+) -> dict | None:
+    if column not in df.columns:
+        return None
+
+    if degree not in {1, 2}:
+        return None
+
+    if not math.isfinite(float(start_decimal_year)) or not math.isfinite(float(end_decimal_year)):
+        return None
+
+    if float(end_decimal_year) <= float(start_decimal_year):
+        return None
+
+    y_smooth = _gaussian_smoothed_enu_series_for_plot(
+        df=df,
+        column=column,
+        x_series=x_series,
+        gaussian_width_days=gaussian_width_days,
+    )
+
+    if y_smooth is None:
+        return None
+
+    x = pd.to_numeric(x_series, errors="coerce")
+    y_mm = pd.to_numeric(y_smooth, errors="coerce") * 1000.0
+
+    mask = (
+        x.notna()
+        & y_mm.notna()
+        & (x >= float(start_decimal_year))
+        & (x <= float(end_decimal_year))
+    )
+
+    if int(mask.sum()) <= degree + 2:
+        return None
+
+    xw = x.loc[mask].to_numpy(dtype=float)
+    yw = y_mm.loc[mask].to_numpy(dtype=float)
+
+    t_days = (xw - float(start_decimal_year)) * 365.25
+
+    try:
+        coeff, cov = np.polyfit(t_days, yw, deg=degree, cov=True)
+    except Exception:
+        return None
+
+    if cov is None:
+        return None
+
+    t_mid = 0.5 * (float(t_days.min()) + float(t_days.max()))
+    x_mid = float(start_decimal_year) + t_mid / 365.25
+
+    try:
+        y_mid_mm = float(np.polyval(coeff, t_mid))
+    except Exception:
+        return None
+
+    if degree == 1:
+        velocity_mm_per_day = float(coeff[0])
+        try:
+            sigma_velocity_mm_per_day = float(math.sqrt(max(float(cov[0, 0]), 0.0)))
+        except Exception:
+            sigma_velocity_mm_per_day = math.nan
+        label_prefix = "v"
+    else:
+        # coeff = [c, b, a] for y = c*t² + b*t + a
+        c = float(coeff[0])
+        b = float(coeff[1])
+
+        velocity_mm_per_day = b + 2.0 * c * t_mid
+
+        gradient = np.array([2.0 * t_mid, 1.0, 0.0], dtype=float)
+
+        try:
+            variance = float(gradient @ cov @ gradient.T)
+            sigma_velocity_mm_per_day = float(math.sqrt(max(variance, 0.0)))
+        except Exception:
+            sigma_velocity_mm_per_day = math.nan
+
+        label_prefix = "v_mid"
+
+    velocity_mm_per_year = velocity_mm_per_day * 365.25
+    sigma_velocity_mm_per_year = sigma_velocity_mm_per_day * 365.25
+
+    if math.isfinite(sigma_velocity_mm_per_year):
+        label = f"{label_prefix}: {velocity_mm_per_year:+.1f} ± {sigma_velocity_mm_per_year:.1f} mm yr⁻¹"
+    else:
+        label = f"{label_prefix}: {velocity_mm_per_year:+.1f} mm yr⁻¹"
+
+    return {
+        "x": x_mid,
+        "y": y_mid_mm / 1000.0,
+        "velocity_mm_per_year": velocity_mm_per_year,
+        "sigma_velocity_mm_per_year": sigma_velocity_mm_per_year,
+        "slope_m_per_year": velocity_mm_per_year / 1000.0,
+        "label": label,
+    }
+
+
+def _enu_rotation_degrees_from_slope(
+    ax,
+    x: float,
+    y: float,
+    slope_m_per_year: float,
+) -> float:
+    try:
+        x0_lim, x1_lim = ax.get_xlim()
+        dx = 0.030 * abs(float(x1_lim) - float(x0_lim))
+        if not math.isfinite(dx) or dx <= 0:
+            dx = 0.10
+    except Exception:
+        dx = 0.10
+
+    try:
+        p0 = ax.transData.transform((x - dx, y - slope_m_per_year * dx))
+        p1 = ax.transData.transform((x + dx, y + slope_m_per_year * dx))
+        angle = math.degrees(math.atan2(float(p1[1] - p0[1]), float(p1[0] - p0[0])))
+    except Exception:
+        angle = 0.0
+
+    if not math.isfinite(angle):
+        return 0.0
+
+    return float(angle)
+
+
+def _add_enu_velocity_label_to_axis(
+    ax,
+    label_info: dict | None,
+) -> None:
+    if label_info is None:
+        return
+
+    try:
+        x = float(label_info["x"])
+        y = float(label_info["y"])
+        label = str(label_info["label"])
+    except Exception:
+        return
+
+    if not math.isfinite(x) or not math.isfinite(y):
+        return
+
+    try:
+        slope_m_per_year = float(label_info.get("slope_m_per_year", math.nan))
+    except Exception:
+        slope_m_per_year = math.nan
+
+    if math.isfinite(slope_m_per_year):
+        rotation = _enu_rotation_degrees_from_slope(
+            ax=ax,
+            x=x,
+            y=y,
+            slope_m_per_year=slope_m_per_year,
+        )
+    else:
+        rotation = 0.0
+
+    try:
+        y0, y1 = ax.get_ylim()
+        dy = 0.020 * abs(float(y1) - float(y0))
+    except Exception:
+        dy = 0.0
+
+    ax.text(
+        x,
+        y + dy,
+        label,
+        color="black",
+        fontsize=6.5,
+        ha="center",
+        va="bottom",
+        rotation=rotation,
+        rotation_mode="anchor",
+        zorder=8,
+        clip_on=True,
+        bbox={
+            "facecolor": "white",
+            "alpha": 0.68,
+            "edgecolor": "none",
+            "pad": 1.3,
+        },
+    )
+
+
+
+
+def _transient_boundary_markers_for_plot(
+    transient_windows: pd.DataFrame,
+) -> list[dict]:
+    tw = _clean_transient_windows_for_plot(transient_windows)
+
+    if tw.empty:
+        return []
+
+    markers = []
+
+    # One marker at the start of each pre-event transient window.
+    pre = tw[tw["window_type"].astype(str) == "pre_event_transient"].copy()
+    for _, item in pre.iterrows():
+        try:
+            x = float(item["start_decimal_year"])
+        except Exception:
+            continue
+
+        if math.isfinite(x):
+            markers.append({
+                "x": x,
+                "label": "pre-event transient",
+            })
+
+    # One marker at the end of each post-event transient window.
+    post = tw[tw["window_type"].astype(str) == "post_event_transient"].copy()
+    for _, item in post.iterrows():
+        try:
+            x = float(item["end_decimal_year"])
+        except Exception:
+            continue
+
+        if math.isfinite(x):
+            markers.append({
+                "x": x,
+                "label": "post-event transient",
+            })
+
+    # Remove exact duplicates while preserving order.
+    unique = []
+    seen = set()
+
+    for item in markers:
+        key = (round(float(item["x"]), 10), str(item["label"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+
+    return unique
+
+
+def _draw_transient_boundary_markers_on_axis(
+    ax,
+    transient_windows: pd.DataFrame,
+    draw_labels: bool = False,
+) -> None:
+    markers = _transient_boundary_markers_for_plot(transient_windows)
+
+    if not markers:
+        return
+
+    for item in markers:
+        x = float(item["x"])
+        label = str(item["label"])
+
+        ax.axvline(
+            x,
+            color="gray",
+            linestyle="--",
+            linewidth=0.9,
+            alpha=0.80,
+            zorder=2,
+        )
+
+        if not draw_labels:
+            continue
+
+        ax.text(
+            x,
+            0.98,
+            label,
+            transform=ax.get_xaxis_transform(),
+            rotation=90,
+            rotation_mode="anchor",
+            ha="right",
+            va="top",
+            color="gray",
+            fontsize=7.0,
+            zorder=9,
+            bbox={
+                "facecolor": "white",
+                "alpha": 0.65,
+                "edgecolor": "none",
+                "pad": 1.2,
+            },
+            clip_on=True,
+        )
+
+def _draw_quadratic_transient_and_stable_linear_enu_overlay(
+    ax,
+    df: pd.DataFrame,
+    x_series: pd.Series,
+    column: str,
+    transient_windows: pd.DataFrame,
+    component_fits: pd.DataFrame,
+    joint_fits: pd.DataFrame,
+    gaussian_width_days: float,
+    label_once: bool,
+) -> bool:
+    if column not in {"E_m", "N_m", "U_m"}:
+        return label_once
+
+    tw = _clean_transient_windows_for_plot(transient_windows)
+    x = pd.to_numeric(x_series, errors="coerce")
+
+    # A. Quadratic curves in pre/post transient windows.
+    for _, window in tw.iterrows():
+        window_type = str(window.get("window_type", ""))
+
+        if window_type not in {"pre_event_transient", "post_event_transient"}:
+            continue
+
+        start_dec = float(window["start_decimal_year"])
+        end_dec = float(window["end_decimal_year"])
+
+        mask = (
+            x.notna()
+            & (x >= start_dec)
+            & (x <= end_dec)
+        )
+
+        if int(mask.sum()) < 5:
+            continue
+
+        x_values = x.loc[mask].to_numpy(dtype=float)
+
+        if column in {"E_m", "N_m"}:
+            fit_row = _select_joint_quadratic_fit_for_window(joint_fits, window)
+        else:
+            fit_row = _select_component_quadratic_fit_for_window(component_fits, window, column)
+
+        if fit_row is None:
+            continue
+
+        y_curve = _quadratic_curve_from_fit_row(
+            x_values=x_values,
+            start_decimal_year=start_dec,
+            fit_row=fit_row,
+            column=column,
+        )
+
+        if y_curve is None:
+            continue
+
+        ax.plot(
+            x_values,
+            y_curve,
+            color="orange",
+            linestyle="--",
+            linewidth=0.9,
+            alpha=0.95,
+            zorder=5,
+            label="quadratic transient fit" if not label_once else None,
+        )
+
+        label_info = _velocity_label_from_smoothed_polynomial_fit(
+            df=df,
+            x_series=x_series,
+            column=column,
+            start_decimal_year=start_dec,
+            end_decimal_year=end_dec,
+            gaussian_width_days=gaussian_width_days,
+            degree=2,
+        )
+        _add_enu_velocity_label_to_axis(ax, label_info)
+
+        label_once = True
+
+    # B. Linear models in stable intervals outside pre/event/post windows.
+    for start_dec, end_dec in _stable_intervals_outside_transient_windows(x_series, tw):
+        fit = _fit_linear_curve_for_enu_plot(
+            df=df,
+            x_series=x_series,
+            column=column,
+            start_decimal_year=start_dec,
+            end_decimal_year=end_dec,
+            gaussian_width_days=gaussian_width_days,
+            min_points=20,
+        )
+
+        if fit is None:
+            continue
+
+        ax.plot(
+            fit["x"],
+            fit["y"],
+            color="green",
+            linestyle="-",
+            linewidth=1.8,
+            alpha=0.95,
+            zorder=4,
+            label="linear stable fit" if not label_once else None,
+        )
+
+        label_info = _velocity_label_from_smoothed_polynomial_fit(
+            df=df,
+            x_series=x_series,
+            column=column,
+            start_decimal_year=start_dec,
+            end_decimal_year=end_dec,
+            gaussian_width_days=gaussian_width_days,
+            degree=1,
+        )
+        _add_enu_velocity_label_to_axis(ax, label_info)
+
+        label_once = True
+
+    return label_once
+
+def _enu_composite_fullspan_plot_html(
+    df: pd.DataFrame,
+    shift_clusters: pd.DataFrame | None = None,
+    meta_cluster_velocity_windows: pd.DataFrame | None = None,
+    velocity_change_diagnostics: dict | None = None,
+    report_analysis_config: dict | None = None,
+) -> str:
+    available = [col for col in ("E_m", "N_m", "U_m") if col in df.columns]
+
+    if not available:
+        return ""
 
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         from matplotlib.ticker import FormatStrFormatter
+    except Exception:
+        return ""
+
+    analysis_cfg = _resolve_report_analysis_config(report_analysis_config)
+    plot_cfg = analysis_cfg.get("plots", {})
+    show_smoothed = bool(plot_cfg.get("show_gaussian_smoothed_enu", True))
+    gaussian_width_days = float(plot_cfg.get("gaussian_width_days", 28.0))
+
+    x_series, x_label = _decimal_year_series_for_composite_plot(df)
+    x = x_series.to_numpy(dtype=float)
+
+    selected_velocity_change_segments = _select_velocity_change_segments_for_plot(
+        velocity_change_diagnostics=velocity_change_diagnostics,
+        report_analysis_config=analysis_cfg,
+    )
+
+    shift_items = []
+    if shift_clusters is not None and len(shift_clusters) > 0:
+        for _, item in shift_clusters.iterrows():
+            try:
+                representative = float(item.get("representative_decimal_year", math.nan))
+            except Exception:
+                representative = math.nan
+
+            try:
+                start_dec = float(item.get("cluster_start_decimal_year", math.nan))
+                end_dec = float(item.get("cluster_end_decimal_year", math.nan))
+            except Exception:
+                start_dec = math.nan
+                end_dec = math.nan
+
+            if not math.isfinite(start_dec):
+                start_dec = representative
+            if not math.isfinite(end_dec):
+                end_dec = representative
+
+            shift_items.append({
+                "representative": representative,
+                "start": start_dec,
+                "end": end_dec,
+            })
+
+    fig, axes = plt.subplots(
+        len(available),
+        1,
+        sharex=True,
+        figsize=(10.8, 2.55 * len(available)),
+        dpi=140,
+    )
+
+    if len(available) == 1:
+        axes = [axes]
+
+    for ax_index, (ax, column) in enumerate(zip(axes, available)):
+        y = pd.to_numeric(df[column], errors="coerce")
+
+        ax.plot(
+            x,
+            y,
+            linestyle="-",
+            color="blue",
+            alpha=0.18,
+            linewidth=0.8,
+            label="raw ENU series",
+            zorder=1,
+        )
+
+        if show_smoothed:
+            y_smooth = _gaussian_smoothed_enu_series_for_plot(
+                df=df,
+                column=column,
+                x_series=x_series,
+                gaussian_width_days=gaussian_width_days,
+            )
+
+            if y_smooth is not None:
+                ax.plot(
+                    x,
+                    y_smooth,
+                    linewidth=1.6,
+                    alpha=0.95,
+                    label=f"Gaussian-smoothed ENU series, {gaussian_width_days:g} d",
+                    zorder=3,
+                )
+
+        transient_windows_for_plot = _transient_windows_from_velocity_diagnostics(
+            velocity_change_diagnostics
+        )
+        component_transient_fits_for_plot = _component_transient_fits_from_velocity_diagnostics(
+            velocity_change_diagnostics
+        )
+        joint_horizontal_fits_for_plot = _joint_horizontal_transient_fits_from_velocity_diagnostics(
+            velocity_change_diagnostics
+        )
+
+        if "_enu_fit_label_used" not in locals():
+            _enu_fit_label_used = False
+
+        _enu_fit_label_used = _draw_quadratic_transient_and_stable_linear_enu_overlay(
+            ax=ax,
+            df=df,
+            x_series=x_series,
+            column=column,
+            transient_windows=transient_windows_for_plot,
+            component_fits=component_transient_fits_for_plot,
+            joint_fits=joint_horizontal_fits_for_plot,
+            gaussian_width_days=gaussian_width_days,
+            label_once=_enu_fit_label_used,
+        )
+
+        _draw_transient_boundary_markers_on_axis(
+            ax=ax,
+            transient_windows=transient_windows_for_plot,
+            draw_labels=(ax_index == 0),
+        )
+
+        for k, shift in enumerate(shift_items):
+            start_sx = shift["start"]
+            end_sx = shift["end"]
+            sx = shift["representative"]
+
+            if math.isfinite(start_sx) and math.isfinite(end_sx):
+                ax.axvspan(
+                    min(start_sx, end_sx),
+                    max(start_sx, end_sx),
+                    color="gray",
+                    alpha=0.16,
+                    label="shift-cluster interval" if k == 0 else None,
+                    zorder=0,
+                )
+
+            if math.isfinite(sx):
+                ax.axvline(
+                    sx,
+                    color="red",
+                    linestyle="--",
+                    linewidth=1.0,
+                    label="representative shift epoch" if k == 0 else None,
+                    zorder=4,
+                )
+
+        ax.set_ylabel(column)
+        ax.grid(True)
+
+        if x_label == "decimal year":
+            ax.xaxis.set_major_formatter(FormatStrFormatter("%.2f"))
+
+    axes[-1].set_xlabel(x_label)
+    axes[0].set_title("ENU composite time series")
+
+    _add_external_legend(fig, axes)
+    fig.tight_layout(rect=[0.0, 0.0, 0.80, 1.0])
+
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", bbox_inches="tight")
+    plt.close(fig)
+
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+
+    return (
+        "<h3>ENU composite full-span plot</h3>"
+        f'<img class="plot" src="data:image/png;base64,{encoded}" alt="ENU composite full-span plot">'
+    )
+
+def _plot_html(
+    df: pd.DataFrame,
+    plot_columns=None,
+    failed_datasets: list[dict] | None = None,
+    shift_clusters: pd.DataFrame | None = None,
+    meta_cluster_velocity_windows: pd.DataFrame | None = None,
+    velocity_change_diagnostics: dict | None = None,
+    report_analysis_config: dict | None = None,
+) -> str:
+    resolved = _resolve_plot_columns(plot_columns)
+
+    enu_composite_requested = any(column in ("E_m", "N_m", "U_m") for _, column in resolved)
+    resolved = [(label, column) for label, column in resolved if column not in ("E_m", "N_m", "U_m")]
+
+    if not resolved and not enu_composite_requested:
+        return "<p>No plots requested.</p>"
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.ticker import FormatStrFormatter, ScalarFormatter
     except Exception as exc:
         return f"<p>Plots could not be generated because matplotlib is unavailable: {_html_escape(exc)}</p>"
+
+    class _PlainOffsetScalarFormatter(ScalarFormatter):
+        def get_offset(self):
+            offset = getattr(self, "offset", 0)
+
+            try:
+                offset = float(offset)
+            except Exception:
+                return ""
+
+            if offset == 0:
+                return ""
+
+            label = f"{offset:+.12f}".rstrip("0").rstrip(".")
+
+            if label in {"+0", "-0"}:
+                return ""
+
+            return label
+
+    def _apply_plain_y_offset_formatter(ax, column: str) -> None:
+        if column not in {"X_m", "Y_m", "Z_m", "lon_deg", "lat_deg", "h_m"}:
+            return
+
+        formatter = _PlainOffsetScalarFormatter(useOffset=True, useMathText=False)
+        formatter.set_useOffset(True)
+        formatter.set_scientific(False)
+        ax.yaxis.set_major_formatter(formatter)
 
     failed_datasets = failed_datasets or []
     failed_x = []
@@ -1242,6 +3060,55 @@ def _plot_html(df: pd.DataFrame, plot_columns=None, failed_datasets: list[dict] 
         if math.isfinite(dec):
             failed_x.append(dec)
 
+    shift_x = []
+    if shift_clusters is not None and len(shift_clusters) > 0:
+        for report_event_id, (_, item) in enumerate(shift_clusters.iterrows(), start=1):
+            try:
+                dec = float(item.get("representative_decimal_year", math.nan))
+            except Exception:
+                dec = math.nan
+
+            try:
+                start_dec = float(item.get("cluster_start_decimal_year", math.nan))
+                end_dec = float(item.get("cluster_end_decimal_year", math.nan))
+            except Exception:
+                start_dec = math.nan
+                end_dec = math.nan
+
+            if not math.isfinite(start_dec):
+                start_dec = dec
+            if not math.isfinite(end_dec):
+                end_dec = dec
+
+            candidates = []
+            raw_candidates = item.get("candidate_decimal_years", "")
+
+            if isinstance(raw_candidates, str):
+                raw_candidate_values = [value.strip() for value in raw_candidates.split(",") if value.strip()]
+            elif isinstance(raw_candidates, (list, tuple)):
+                raw_candidate_values = raw_candidates
+            else:
+                raw_candidate_values = []
+
+            for value in raw_candidate_values:
+                try:
+                    candidate_dec = float(value)
+                except Exception:
+                    candidate_dec = math.nan
+
+                if math.isfinite(candidate_dec):
+                    candidates.append(candidate_dec)
+
+            if math.isfinite(dec):
+                shift_x.append({
+                    "x": dec,
+                    "start": min(start_dec, end_dec),
+                    "end": max(start_dec, end_dec),
+                    "label": f"{dec:.4f}",
+                    "report_event_id": report_event_id,
+                    "candidates": candidates,
+                })
+
     if "time_mean_all_epochs_utc" in df.columns:
         times = pd.to_datetime(df["time_mean_all_epochs_utc"], errors="coerce", utc=True)
         x = [_timestamp_to_decimal_year(t) for t in times]
@@ -1250,8 +3117,24 @@ def _plot_html(df: pd.DataFrame, plot_columns=None, failed_datasets: list[dict] 
         x = list(range(1, len(df) + 1))
         x_label = "solution index"
         failed_x = []
+        shift_x = []
+
+    x_series = pd.Series(x, index=df.index, dtype="float64")
 
     html_parts = []
+
+    if enu_composite_requested:
+        enu_composite_html = _enu_composite_fullspan_plot_html(
+            df=df,
+            shift_clusters=shift_clusters,
+            meta_cluster_velocity_windows=meta_cluster_velocity_windows,
+            velocity_change_diagnostics=velocity_change_diagnostics,
+            report_analysis_config=report_analysis_config,
+        )
+
+        if enu_composite_html:
+            html_parts.append(enu_composite_html)
+
     html_parts.append(
         "<p>The following plots are generated from the daily/per-file primary solutions stored in "
         "<code>timeseries.out</code>. The x-axis is shown as decimal year where time metadata are available.</p>"
@@ -1261,6 +3144,14 @@ def _plot_html(df: pd.DataFrame, plot_columns=None, failed_datasets: list[dict] 
         html_parts.append(
             "<p>Red dashed vertical lines indicate datasets that did not complete successfully and are therefore "
             "not included in <code>timeseries.out</code>.</p>"
+        )
+
+    if shift_x:
+        html_parts.append(
+            "<p>Shift annotations are shown only on the E_m, N_m, and U_m full-span plots. "
+            "Grey intervals indicate report-grade strict-cluster spans, and red dashed vertical "
+            "lines indicate representative strict-cluster epochs. Accepted shift-candidate epochs "
+            "are shown only in the zoom plots.</p>"
         )
 
     for label, column in resolved:
@@ -1275,10 +3166,24 @@ def _plot_html(df: pd.DataFrame, plot_columns=None, failed_datasets: list[dict] 
             continue
 
         fig, ax = plt.subplots(figsize=(8.0, 4.2), dpi=140)
-        ax.plot(x, y, linestyle="-")
+
+        if column in ("E_m", "N_m", "U_m"):
+            ax.plot(
+                x,
+                y,
+                linestyle="-",
+                color="blue",
+                alpha=0.18,
+                linewidth=0.8,
+                label="raw ENU series",
+                zorder=1,
+            )
+        else:
+            ax.plot(x, y, linestyle="-")
         ax.set_title(f"{column} time series")
         ax.set_xlabel(x_label)
         ax.set_ylabel(column)
+        _apply_plain_y_offset_formatter(ax, column)
         ax.grid(True)
 
         if x_label == "decimal year":
@@ -1290,14 +3195,97 @@ def _plot_html(df: pd.DataFrame, plot_columns=None, failed_datasets: list[dict] 
                 color="red",
                 linestyle="--",
                 linewidth=1.0,
-                alpha=0.85,
+                alpha=0.45,
                 label="non-successful dataset" if k == 0 else None,
             )
 
-        if failed_x:
-            ax.legend(loc="best")
+        analysis_cfg = _resolve_report_analysis_config(report_analysis_config)
+        plot_cfg = analysis_cfg["plots"]
 
-        fig.tight_layout()
+        if column in ("E_m", "N_m", "U_m") and bool(plot_cfg.get("show_gaussian_smoothed_enu", True)):
+            plot_gaussian_width_days = float(plot_cfg.get("gaussian_width_days", 28.0))
+
+            y_smooth = _gaussian_smoothed_enu_series_for_plot(
+                df=df,
+                column=column,
+                x_series=x_series,
+                gaussian_width_days=plot_gaussian_width_days,
+            )
+
+            if y_smooth is not None:
+                ax.plot(
+                    x,
+                    y_smooth,
+                    linewidth=1.6,
+                    alpha=0.95,
+                    label=f"Gaussian-smoothed ENU series, {plot_gaussian_width_days:g} d",
+                    zorder=3,
+                )
+
+        velocity_trends_drawn = _draw_velocity_trends_on_fullspan_axis(
+            ax=ax,
+            df=df,
+            column=column,
+            x_series=x_series,
+            velocity_windows=meta_cluster_velocity_windows,
+        )
+
+        show_shift_annotations = column in ("E_m", "N_m", "U_m")
+
+        if show_shift_annotations:
+            for k, item in enumerate(shift_x):
+                sx = item["x"]
+                start_sx = item.get("start", sx)
+                end_sx = item.get("end", sx)
+
+                if (
+                    math.isfinite(start_sx)
+                    and math.isfinite(end_sx)
+                    and abs(end_sx - start_sx) > 0
+                ):
+                    ax.axvspan(
+                        start_sx,
+                        end_sx,
+                        color="gray",
+                        alpha=0.12,
+                        label="shift-cluster interval" if k == 0 else None,
+                    )
+
+                ax.axvline(
+                    sx,
+                    color="red",
+                    linestyle="--",
+                    linewidth=1.2,
+                    alpha=0.95,
+                    label="representative shift epoch" if k == 0 else None,
+                )
+                ax.text(
+                    sx,
+                    -0.13,
+                    item["label"],
+                    transform=ax.get_xaxis_transform(),
+                    color="red",
+                    fontsize=7,
+                    rotation=90,
+                    ha="center",
+                    va="top",
+                    clip_on=False,
+                )
+
+        if failed_x or (shift_x and column in ("E_m", "N_m", "U_m")) or velocity_trends_drawn:
+            ax.legend(
+                loc="upper left",
+                bbox_to_anchor=(1.02, 1.0),
+                borderaxespad=0.0,
+                fontsize=8,
+            )
+
+        if shift_x and column in ("E_m", "N_m", "U_m"):
+            fig.tight_layout(rect=[0, 0.08, 0.80, 1])
+        elif failed_x or velocity_trends_drawn:
+            fig.tight_layout(rect=[0, 0, 0.80, 1])
+        else:
+            fig.tight_layout()
 
         buffer = io.BytesIO()
         fig.savefig(buffer, format="png", bbox_inches="tight")
@@ -1337,12 +3325,2139 @@ def _daily_summary_html(df: pd.DataFrame) -> str:
     ]
 
     return _df_to_html_table(df, columns)
+
+
+def _parse_candidate_decimal_years(value) -> list[float]:
+    if value is None:
+        return []
+
+    if isinstance(value, str):
+        parts = [item.strip() for item in value.split(",") if item.strip()]
+    elif isinstance(value, (list, tuple)):
+        parts = list(value)
+    else:
+        return []
+
+    out = []
+
+    for item in parts:
+        try:
+            dec = float(item)
+        except Exception:
+            dec = math.nan
+
+        if math.isfinite(dec):
+            out.append(dec)
+
+    return out
+
+
+def _decimal_year_series_from_times(df: pd.DataFrame) -> pd.Series:
+    if "time_mean_all_epochs_utc" not in df.columns:
+        return pd.Series([math.nan] * len(df), index=df.index)
+
+    times = pd.to_datetime(df["time_mean_all_epochs_utc"], errors="coerce", utc=True)
+    values = []
+
+    for t in times:
+        if pd.isna(t):
+            values.append(math.nan)
+            continue
+
+        start = pd.Timestamp(year=int(t.year), month=1, day=1, tz="UTC")
+        end = pd.Timestamp(year=int(t.year) + 1, month=1, day=1, tz="UTC")
+        values.append(float(int(t.year) + (t - start).total_seconds() / (end - start).total_seconds()))
+
+    return pd.Series(values, index=df.index)
+
+
+def _shift_cluster_zoom_plots_html(df: pd.DataFrame, shift_clusters: pd.DataFrame | None = None) -> str:
+    if shift_clusters is None or len(shift_clusters) == 0:
+        return "<p>No report-grade shift clusters available for zoom plotting.</p>"
+
+    required_columns = ["E_m", "N_m", "U_m"]
+    missing = [col for col in required_columns if col not in df.columns]
+
+    if missing:
+        return "<p>Shift-cluster zoom plots could not be generated because required ENU columns are missing.</p>"
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.ticker import FormatStrFormatter
+    except Exception as exc:
+        return f"<p>Shift-cluster zoom plots could not be generated because matplotlib is unavailable: {_html_escape(exc)}</p>"
+
+    x = _decimal_year_series_from_times(df)
+    html_parts = []
+
+    html_parts.append(
+        "<p>The following plots zoom into the temporal span of each report-grade shift cluster. "
+        "They show the ENU components only, with accepted shift candidates marked in pale purple "
+        "and the representative shift epoch marked in red.</p>"
+    )
+
+    for report_event_id, (_, cluster) in enumerate(shift_clusters.iterrows(), start=1):
+        try:
+            start_dec = float(cluster.get("cluster_start_decimal_year", math.nan))
+            end_dec = float(cluster.get("cluster_end_decimal_year", math.nan))
+            rep_dec = float(cluster.get("representative_decimal_year", math.nan))
+        except Exception:
+            start_dec = math.nan
+            end_dec = math.nan
+            rep_dec = math.nan
+
+        if not math.isfinite(start_dec) or not math.isfinite(end_dec):
+            continue
+
+        lo = min(start_dec, end_dec)
+        hi = max(start_dec, end_dec)
+
+        if not math.isfinite(rep_dec):
+            rep_dec = (lo + hi) / 2.0
+
+        candidates = _parse_candidate_decimal_years(cluster.get("candidate_decimal_years", ""))
+
+        mask = (x >= lo) & (x <= hi)
+        sub = df.loc[mask].copy()
+        sub_x = x.loc[mask]
+
+        if len(sub) == 0:
+            continue
+
+        internal_cluster_id = cluster.get("cluster_id", "")
+        event_class = _shift_cluster_event_class(cluster)
+        components = cluster.get("components", "")
+
+        html_parts.append(
+            f"<h3>Shift-cluster zoom plots — report event {report_event_id}, "
+            f"internal cluster { _html_escape(internal_cluster_id) }</h3>"
+        )
+        html_parts.append(
+            "<p>"
+            f"Event class: <code>{_html_escape(event_class)}</code>; "
+            f"components: <code>{_html_escape(components)}</code>; "
+            f"cluster interval: <code>{_fmt(lo, digits=4)}–{_fmt(hi, digits=4)}</code>; "
+            f"representative epoch: <code>{_fmt(rep_dec, digits=4)}</code>."
+            "</p>"
+        )
+
+        for column in required_columns:
+            y = pd.to_numeric(sub[column], errors="coerce")
+
+            fig, ax = plt.subplots(figsize=(10.5, 4.2))
+            ax.plot(sub_x, y, linewidth=1.3)
+
+            ax.axvspan(
+                lo,
+                hi,
+                color="gray",
+                alpha=0.12,
+                label="shift-cluster interval",
+            )
+
+            for idx, candidate_x in enumerate(candidates):
+                if candidate_x < lo or candidate_x > hi:
+                    continue
+
+                ax.axvline(
+                    candidate_x,
+                    color="purple",
+                    linestyle="--",
+                    linewidth=0.7,
+                    alpha=0.35,
+                    label="accepted shift candidate" if idx == 0 else None,
+                )
+                ax.text(
+                    candidate_x,
+                    -0.26,
+                    f"{candidate_x:.4f}",
+                    transform=ax.get_xaxis_transform(),
+                    color="purple",
+                    fontsize=5,
+                    rotation=90,
+                    ha="center",
+                    va="top",
+                    alpha=0.50,
+                    clip_on=False,
+                )
+
+            ax.axvline(
+                rep_dec,
+                color="red",
+                linestyle="--",
+                linewidth=1.3,
+                alpha=0.95,
+                label="representative shift epoch",
+            )
+            ax.text(
+                rep_dec,
+                -0.12,
+                f"{rep_dec:.4f}",
+                transform=ax.get_xaxis_transform(),
+                color="red",
+                fontsize=7,
+                rotation=90,
+                ha="center",
+                va="top",
+                clip_on=False,
+            )
+
+            ax.set_title(f"{column} zoom — report event {report_event_id}")
+            ax.set_xlabel("decimal year")
+            ax.set_ylabel(column)
+            ax.xaxis.set_major_formatter(FormatStrFormatter("%.4f"))
+            ax.grid(True)
+            ax.legend(loc="best")
+            fig.tight_layout(rect=[0, 0.18, 1, 1])
+
+            buffer = io.BytesIO()
+            fig.savefig(buffer, format="png", dpi=140)
+            plt.close(fig)
+
+            encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+            html_parts.append(
+                f'<img class="plot" src="data:image/png;base64,{encoded}" alt="{_html_escape(column)} zoom plot">'
+            )
+
+    if len(html_parts) == 1:
+        html_parts.append("<p>No valid shift-cluster zoom plots were generated.</p>")
+
+    return chr(10).join(html_parts)
+
+
+def _compute_report_meta_clusters(strict_clusters: pd.DataFrame, report_analysis_config: dict | None = None) -> pd.DataFrame:
+    if strict_clusters is None or len(strict_clusters) == 0:
+        return pd.DataFrame()
+
+    try:
+        import timeseries_change_detection as tcd
+    except Exception:
+        return pd.DataFrame()
+
+    if not hasattr(tcd, "MetaClusteringConfig") or not hasattr(tcd, "create_meta_clusters"):
+        return pd.DataFrame()
+
+    analysis_cfg = _resolve_report_analysis_config(report_analysis_config)
+    meta_cfg = analysis_cfg["meta_clustering"]
+
+    cfg = tcd.MetaClusteringConfig(
+        enabled=bool(meta_cfg["enabled"]),
+        max_gap_days=float(meta_cfg["max_gap_days"]),
+        enable_direction_similarity=bool(meta_cfg["enable_direction_similarity"]),
+        direction_mode=str(meta_cfg["direction_mode"]),
+        max_direction_change_deg=float(meta_cfg["max_direction_change_deg"]),
+        enable_magnitude_compatibility=bool(meta_cfg["enable_magnitude_compatibility"]),
+        max_magnitude_ratio=float(meta_cfg["max_magnitude_ratio"]),
+    )
+
+    try:
+        return tcd.create_meta_clusters(strict_clusters, cfg)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _meta_clusters_html(meta_clusters: pd.DataFrame) -> str:
+    text = []
+
+    text.append(
+        "<p>Level-2 meta-clustering groups neighbouring report-grade strict clusters. "
+        "Current fixed V1 meta-clustering defaults are: "
+        "<code>max_gap_days = 14</code>, "
+        "<code>direction_mode = horizontal</code>, "
+        "<code>maximum adjacent direction-change tolerance = 45 degrees</code>, and "
+        "<code>magnitude compatibility = disabled</code>.</p>"
+    )
+
+    if meta_clusters is None or len(meta_clusters) == 0:
+        text.append("<p>No report-grade meta-clusters were created.</p>")
+        return chr(10).join(text)
+
+    rows = []
+
+    for _, item in meta_clusters.iterrows():
+        rows.append([
+            _html_escape(item.get("meta_cluster_id", "")),
+            _html_escape(item.get("strict_cluster_ids", "")),
+            _html_escape(item.get("n_strict_clusters", "")),
+            _html_escape(_fmt(item.get("meta_start_decimal_year", math.nan), digits=4)),
+            _html_escape(_fmt(item.get("meta_end_decimal_year", math.nan), digits=4)),
+            _html_escape(_fmt(item.get("meta_duration_days", math.nan), digits=3)),
+            _html_escape(_fmt(item.get("representative_decimal_year", math.nan), digits=4)),
+            _html_escape(item.get("representative_time_utc", "")),
+            _html_escape(item.get("components", "")),
+            _html_escape(_fmt(item.get("E_net_jump_mm", math.nan), digits=3)),
+            _html_escape(_fmt(item.get("N_net_jump_mm", math.nan), digits=3)),
+            _html_escape(_fmt(item.get("U_net_jump_mm", math.nan), digits=3)),
+            _html_escape(_fmt(item.get("horizontal_net_jump_mm", math.nan), digits=3)),
+            _html_escape(_fmt(item.get("total_net_jump_mm", math.nan), digits=3)),
+            _html_escape(_fmt(item.get("max_gap_days", math.nan), digits=3)),
+            _html_escape(_fmt(item.get("max_adjacent_direction_change_deg", math.nan), digits=3)),
+            _html_escape(_fmt(item.get("cumulative_rotation_deg", math.nan), digits=3)),
+            _html_escape(item.get("direction_behaviour", "")),
+        ])
+
+    text.append(_html_table(
+        [
+            "Meta event",
+            "Strict cluster IDs",
+            "Strict cluster count",
+            "Meta start decimal year",
+            "Meta end decimal year",
+            "Meta duration (days)",
+            "Representative decimal year",
+            "Representative UTC",
+            "Components",
+            "E net jump (mm)",
+            "N net jump (mm)",
+            "U net jump (mm)",
+            "Horizontal net jump (mm)",
+            "Total net jump (mm)",
+            "Max gap (days)",
+            "Max adjacent direction change (deg)",
+            "Cumulative rotation (deg)",
+            "Direction behaviour",
+        ],
+        rows,
+    ))
+
+    text.append(
+        "<p>Net jumps are computed from the strict-cluster representative component jumps. "
+        "A missing component in a strict cluster means that no accepted component candidate "
+        "was assigned to that strict cluster, not that the physical displacement is proven zero.</p>"
+    )
+
+    return chr(10).join(text)
+
+
+def _compute_meta_cluster_velocity_windows(df: pd.DataFrame, meta_clusters: pd.DataFrame, report_analysis_config: dict | None = None) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+
+    if meta_clusters is None or len(meta_clusters) == 0:
+        return pd.DataFrame()
+
+    try:
+        import timeseries_velocity_detection as tvd
+    except Exception:
+        return pd.DataFrame()
+
+    if not hasattr(tvd, "MetaClusterVelocityWindowConfig"):
+        return pd.DataFrame()
+
+    if not hasattr(tvd, "fit_velocity_windows_around_meta_clusters"):
+        return pd.DataFrame()
+
+    analysis_cfg = _resolve_report_analysis_config(report_analysis_config)
+    vel_cfg = analysis_cfg["velocity_windows"]
+
+    cfg = tvd.MetaClusterVelocityWindowConfig(
+        columns=("E_m", "N_m", "U_m"),
+        min_points_per_window=int(vel_cfg["min_points_per_window"]),
+        min_duration_days_for_stable_rate=float(vel_cfg["min_duration_days_for_stable_rate"]),
+        apply_gaussian_smoothing=bool(vel_cfg["apply_gaussian_smoothing"]),
+        gaussian_width_days=float(vel_cfg["gaussian_width_days"]),
+        outlier_rejection_enabled=bool(vel_cfg["outlier_rejection_enabled"]),
+        sigma_floor_m=float(vel_cfg["sigma_floor_m"]),
+    )
+
+    try:
+        return tvd.fit_velocity_windows_around_meta_clusters(
+            df=df,
+            meta_clusters=meta_clusters,
+            cfg=cfg,
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+def _meta_cluster_velocity_windows_html(velocity_windows: pd.DataFrame) -> str:
+    text = []
+
+    text.append(
+        "<p>This section estimates component-wise rates around each report-grade meta-cluster. "
+        "For <code>before_meta_cluster</code> and <code>after_meta_cluster</code>, the reported value is a "
+        "stable-window velocity estimated from Gaussian-smoothed ENU series. Current fixed V1 defaults are: "
+        "<code>minimum stable velocity period = 365.25 days</code>, "
+        "<code>Gaussian smoothing width = 28 days</code>, and robust pre-smoothing outlier rejection. "
+        "For <code>during_meta_cluster</code>, the reported value is a transition rate derived from the "
+        "meta-cluster net displacement divided by the meta-cluster duration; it is not treated as a secular "
+        "geodetic velocity.</p>"
+    )
+
+    if velocity_windows is None or len(velocity_windows) == 0:
+        text.append("<p>No meta-cluster velocity-window estimates were generated.</p>")
+        return chr(10).join(text)
+
+    rows = []
+
+    for _, item in velocity_windows.iterrows():
+        rows.append([
+            _html_escape(item.get("meta_cluster_id", "")),
+            _html_escape(item.get("strict_cluster_ids", "")),
+            _html_escape(item.get("component", "")),
+            _html_escape(item.get("window_label", "")),
+            _html_escape(item.get("rate_class", "")),
+            _html_escape(_fmt(item.get("start_decimal_year", math.nan), digits=4)),
+            _html_escape(_fmt(item.get("end_decimal_year", math.nan), digits=4)),
+            _html_escape(_fmt(item.get("duration_days", math.nan), digits=3)),
+            _html_escape(item.get("n_points", "")),
+            _html_escape(item.get("n_points_used_for_smoothing", "")),
+            _html_escape(item.get("series_used_for_fit", "")),
+            _html_escape(_fmt(item.get("gaussian_width_days", math.nan), digits=3)),
+            _html_escape(_fmt(item.get("velocity_mm_per_year", math.nan), digits=3)),
+            _html_escape(_fmt(item.get("estimated_displacement_mm", math.nan), digits=3)),
+            _html_escape(_fmt(item.get("sigma_m", math.nan), digits=6)),
+            _html_escape(item.get("quality_flag", "")),
+        ])
+
+    text.append(_html_table(
+        [
+            "Meta event",
+            "Strict cluster IDs",
+            "Component",
+            "Window",
+            "Rate class",
+            "Start decimal year",
+            "End decimal year",
+            "Duration (days)",
+            "Points",
+            "Points used for smoothing",
+            "Series used",
+            "Gaussian width (days)",
+            "Rate (mm/yr)",
+            "Estimated displacement (mm)",
+            "Sigma (m)",
+            "Quality flag",
+        ],
+        rows,
+    ))
+
+    text.append(
+        "<p><strong>Interpretation note:</strong> rows marked <code>transition_rate</code> describe the "
+        "mean transition rate implied by the detected meta-cluster displacement. They should not be interpreted "
+        "as long-term station velocities. Rows marked <code>stable_window_velocity</code> are velocity estimates "
+        "for the pre- and post-event windows, provided the window duration passes the minimum stable-period criterion.</p>"
+    )
+
+    return chr(10).join(text)
+
+
+
+def _decimal_year_to_calendar_date_label(decimal_year) -> str:
+    try:
+        dec = float(decimal_year)
+    except Exception:
+        return ""
+
+    if not math.isfinite(dec):
+        return ""
+
+    year = int(math.floor(dec))
+    frac = dec - year
+
+    try:
+        start = pd.Timestamp(year=year, month=1, day=1, tz="UTC")
+        end = pd.Timestamp(year=year + 1, month=1, day=1, tz="UTC")
+        t = start + pd.to_timedelta(frac * (end - start).total_seconds(), unit="s")
+        return t.strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+def _component_window_displacement_summary(
+    df: pd.DataFrame,
+    component: str,
+    x_series: pd.Series,
+    x0: float,
+    x1: float,
+    gaussian_width_days: float,
+) -> dict:
+    empty = {
+        f"{component}_start_mm": math.nan,
+        f"{component}_end_mm": math.nan,
+        f"{component}_net_mm": math.nan,
+        f"{component}_range_mm": math.nan,
+    }
+
+    if component not in df.columns:
+        return empty
+
+    if not math.isfinite(x0) or not math.isfinite(x1) or x1 <= x0:
+        return empty
+
+    y_smooth = _gaussian_smoothed_enu_series_for_plot(
+        df=df,
+        column=component,
+        x_series=x_series,
+        gaussian_width_days=gaussian_width_days,
+    )
+
+    if y_smooth is None:
+        y_smooth = pd.to_numeric(df[component], errors="coerce")
+
+    x = pd.to_numeric(x_series, errors="coerce")
+    y = pd.to_numeric(y_smooth, errors="coerce")
+
+    mask = (x >= x0) & (x <= x1) & x.notna() & y.notna()
+
+    xw = x.loc[mask]
+    yw = y.loc[mask]
+
+    if len(yw) < 2:
+        return empty
+
+    start_mm = float(yw.iloc[0]) * 1000.0
+    end_mm = float(yw.iloc[-1]) * 1000.0
+    net_mm = end_mm - start_mm
+    range_mm = float((yw.max() - yw.min()) * 1000.0)
+
+    return {
+        f"{component}_start_mm": start_mm,
+        f"{component}_end_mm": end_mm,
+        f"{component}_net_mm": net_mm,
+        f"{component}_range_mm": range_mm,
+    }
+
+
+def _compute_transient_windows_from_velocity_change_clusters(
+    df: pd.DataFrame,
+    meta_clusters: pd.DataFrame,
+    velocity_change_diagnostics: dict,
+    report_analysis_config: dict | None = None,
+) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+
+    if meta_clusters is None or len(meta_clusters) == 0:
+        return pd.DataFrame()
+
+    classified = velocity_change_diagnostics.get("classified", pd.DataFrame())
+
+    if classified is None or len(classified) == 0:
+        return pd.DataFrame()
+
+    analysis_cfg = _resolve_report_analysis_config(report_analysis_config)
+    plot_cfg = analysis_cfg.get("plots", {})
+    gaussian_width_days = float(plot_cfg.get("gaussian_width_days", 28.0))
+
+    x_series, _ = _decimal_year_series_for_composite_plot(df)
+
+    related_h = classified.copy()
+
+    required = {
+        "component",
+        "report_grade",
+        "shift_related_velocity_change",
+        "cluster_start_decimal_year",
+        "cluster_end_decimal_year",
+    }
+
+    if not required.issubset(set(related_h.columns)):
+        return pd.DataFrame()
+
+    related_h = related_h[
+        (related_h["component"].astype(str) == "H_magnitude")
+        & (related_h["report_grade"] == True)
+        & (related_h["shift_related_velocity_change"] == True)
+    ].copy()
+
+    if len(related_h) == 0:
+        return pd.DataFrame()
+
+    for col in ["cluster_start_decimal_year", "cluster_end_decimal_year"]:
+        related_h[col] = pd.to_numeric(related_h[col], errors="coerce")
+
+    related_h = related_h.dropna(subset=["cluster_start_decimal_year", "cluster_end_decimal_year"])
+
+    rows = []
+
+    for _, meta in meta_clusters.iterrows():
+        try:
+            meta_id = meta.get("meta_cluster_id", meta.get("cluster_id", ""))
+        except Exception:
+            meta_id = ""
+
+        try:
+            meta_start = float(meta.get("meta_start_decimal_year", math.nan))
+            meta_end = float(meta.get("meta_end_decimal_year", math.nan))
+        except Exception:
+            meta_start = math.nan
+            meta_end = math.nan
+
+        if not math.isfinite(meta_start) or not math.isfinite(meta_end):
+            continue
+
+        if meta_end < meta_start:
+            meta_start, meta_end = meta_end, meta_start
+
+        meta_duration_days = float((meta_end - meta_start) * 365.25)
+
+        pre_candidates = related_h[related_h["cluster_start_decimal_year"] < meta_start]
+        post_candidates = related_h[related_h["cluster_end_decimal_year"] > meta_end]
+
+        pre_start = math.nan
+        pre_end = math.nan
+
+        if len(pre_candidates) > 0:
+            pre_start = float(pre_candidates["cluster_start_decimal_year"].min())
+            pre_end = meta_start
+
+        post_start = math.nan
+        post_end = math.nan
+
+        if len(post_candidates) > 0:
+            post_start = meta_end
+            post_end = float(post_candidates["cluster_end_decimal_year"].max())
+
+        # Event/incidence row from meta-cluster net displacement.
+        event_row = {
+            "meta_cluster_id": meta_id,
+            "window_type": "event_incidence",
+            "interpretation": "net displacement and deformation rate during incidence; no velocity fit",
+            "start_decimal_year": meta_start,
+            "end_decimal_year": meta_end,
+            "start_date": _decimal_year_to_calendar_date_label(meta_start),
+            "end_date": _decimal_year_to_calendar_date_label(meta_end),
+            "duration_days": meta_duration_days,
+            "source": "meta_cluster_net_displacement",
+        }
+
+        for comp, meta_col in [
+            ("E_m", "E_net_jump_mm"),
+            ("N_m", "N_net_jump_mm"),
+            ("U_m", "U_net_jump_mm"),
+        ]:
+            try:
+                net_mm = float(meta.get(meta_col, math.nan))
+            except Exception:
+                net_mm = math.nan
+
+            event_row[f"{comp}_net_mm"] = net_mm
+            event_row[f"{comp}_range_mm"] = math.nan
+
+            if math.isfinite(net_mm) and meta_duration_days > 0:
+                event_row[f"{comp}_rate_mm_per_day"] = net_mm / meta_duration_days
+            else:
+                event_row[f"{comp}_rate_mm_per_day"] = math.nan
+
+        try:
+            h_net = float(meta.get("horizontal_net_jump_mm", math.nan))
+        except Exception:
+            h_net = math.nan
+
+        event_row["H_net_mm"] = h_net
+        event_row["H_range_mm"] = math.nan
+        event_row["H_rate_mm_per_day"] = h_net / meta_duration_days if math.isfinite(h_net) and meta_duration_days > 0 else math.nan
+
+        rows.append(event_row)
+
+        # Pre-event transient row.
+        if math.isfinite(pre_start) and math.isfinite(pre_end) and pre_end > pre_start:
+            pre_row = {
+                "meta_cluster_id": meta_id,
+                "window_type": "pre_event_transient",
+                "interpretation": "automatic transient window inferred from shift-related report-grade velocity-change clusters; excluded from stable rolling velocity interpretation",
+                "start_decimal_year": pre_start,
+                "end_decimal_year": pre_end,
+                "start_date": _decimal_year_to_calendar_date_label(pre_start),
+                "end_date": _decimal_year_to_calendar_date_label(pre_end),
+                "duration_days": float((pre_end - pre_start) * 365.25),
+                "source": "velocity_change_clusters",
+            }
+
+            for comp in ["E_m", "N_m", "U_m"]:
+                pre_row.update(_component_window_displacement_summary(
+                    df=df,
+                    component=comp,
+                    x_series=x_series,
+                    x0=pre_start,
+                    x1=pre_end,
+                    gaussian_width_days=gaussian_width_days,
+                ))
+
+            e_net = pre_row.get("E_m_net_mm", math.nan)
+            n_net = pre_row.get("N_m_net_mm", math.nan)
+
+            if math.isfinite(e_net) and math.isfinite(n_net):
+                pre_row["H_net_mm"] = math.sqrt(e_net ** 2 + n_net ** 2)
+            else:
+                pre_row["H_net_mm"] = math.nan
+
+            rows.append(pre_row)
+
+        # Post-event transient row.
+        if math.isfinite(post_start) and math.isfinite(post_end) and post_end > post_start:
+            post_row = {
+                "meta_cluster_id": meta_id,
+                "window_type": "post_event_transient",
+                "interpretation": "automatic transient window inferred from shift-related report-grade velocity-change clusters; excluded from stable rolling velocity interpretation",
+                "start_decimal_year": post_start,
+                "end_decimal_year": post_end,
+                "start_date": _decimal_year_to_calendar_date_label(post_start),
+                "end_date": _decimal_year_to_calendar_date_label(post_end),
+                "duration_days": float((post_end - post_start) * 365.25),
+                "source": "velocity_change_clusters",
+            }
+
+            for comp in ["E_m", "N_m", "U_m"]:
+                post_row.update(_component_window_displacement_summary(
+                    df=df,
+                    component=comp,
+                    x_series=x_series,
+                    x0=post_start,
+                    x1=post_end,
+                    gaussian_width_days=gaussian_width_days,
+                ))
+
+            e_net = post_row.get("E_m_net_mm", math.nan)
+            n_net = post_row.get("N_m_net_mm", math.nan)
+
+            if math.isfinite(e_net) and math.isfinite(n_net):
+                post_row["H_net_mm"] = math.sqrt(e_net ** 2 + n_net ** 2)
+            else:
+                post_row["H_net_mm"] = math.nan
+
+            rows.append(post_row)
+
+    return pd.DataFrame(rows)
+
+
+
+def _transient_fit_design_matrix(
+    t_days: np.ndarray,
+    model_name: str,
+    tau_days: float | None = None,
+) -> tuple[np.ndarray | None, list[str]]:
+    if model_name == "linear":
+        return np.column_stack([np.ones_like(t_days), t_days]), [
+            "intercept_mm",
+            "linear_mm_per_day",
+        ]
+
+    if model_name == "quadratic":
+        return np.column_stack([np.ones_like(t_days), t_days, t_days ** 2]), [
+            "intercept_mm",
+            "linear_mm_per_day",
+            "quadratic_mm_per_day2",
+        ]
+
+    if model_name == "exponential":
+        if tau_days is None or not math.isfinite(float(tau_days)) or float(tau_days) <= 0:
+            return None, []
+
+        basis = 1.0 - np.exp(-t_days / float(tau_days))
+
+        return np.column_stack([np.ones_like(t_days), t_days, basis]), [
+            "intercept_mm",
+            "linear_mm_per_day",
+            "amplitude_mm",
+        ]
+
+    if model_name == "logarithmic":
+        if tau_days is None or not math.isfinite(float(tau_days)) or float(tau_days) <= 0:
+            return None, []
+
+        basis = np.log1p(t_days / float(tau_days))
+
+        return np.column_stack([np.ones_like(t_days), t_days, basis]), [
+            "intercept_mm",
+            "linear_mm_per_day",
+            "amplitude_mm",
+        ]
+
+    return None, []
+
+
+def _fit_transient_model_least_squares(
+    t_days: np.ndarray,
+    y_mm: np.ndarray,
+    model_name: str,
+    tau_days: float | None = None,
+) -> dict:
+    X, names = _transient_fit_design_matrix(t_days, model_name, tau_days=tau_days)
+
+    if X is None or len(names) == 0:
+        return {"ok": False, "reason": "invalid_design_matrix"}
+
+    n = int(len(y_mm))
+    k = int(X.shape[1])
+
+    if n <= k + 1:
+        return {"ok": False, "reason": "insufficient_points"}
+
+    try:
+        beta, residuals, rank, singular_values = np.linalg.lstsq(X, y_mm, rcond=None)
+    except Exception as exc:
+        return {"ok": False, "reason": f"least_squares_failed: {exc}"}
+
+    if rank < k:
+        return {"ok": False, "reason": "rank_deficient"}
+
+    y_hat = X @ beta
+    residual = y_mm - y_hat
+    rss = float(np.sum(residual ** 2))
+
+    if not math.isfinite(rss):
+        return {"ok": False, "reason": "invalid_rss"}
+
+    rss_for_ic = max(rss, 1.0e-12)
+
+    rms_mm = float(math.sqrt(rss / n))
+    aic = float(n * math.log(rss_for_ic / n) + 2 * k)
+    bic = float(n * math.log(rss_for_ic / n) + k * math.log(n))
+
+    out = {
+        "ok": True,
+        "model_name": model_name,
+        "tau_days": float(tau_days) if tau_days is not None else math.nan,
+        "n_points": n,
+        "n_parameters": k,
+        "rank": int(rank),
+        "rss_mm2": rss,
+        "rms_mm": rms_mm,
+        "aic": aic,
+        "bic": bic,
+        "reason": "",
+    }
+
+    for name, value in zip(names, beta):
+        out[name] = float(value)
+
+    for name in [
+        "intercept_mm",
+        "linear_mm_per_day",
+        "quadratic_mm_per_day2",
+        "amplitude_mm",
+    ]:
+        if name not in out:
+            out[name] = math.nan
+
+    return out
+
+
+def _tau_grid_for_transient_fit(duration_days: float) -> list[float]:
+    if not math.isfinite(duration_days) or duration_days <= 0:
+        return []
+
+    lo = max(3.0, 0.03 * duration_days)
+    hi = max(lo * 1.01, 3.0 * duration_days)
+
+    try:
+        grid = np.geomspace(lo, hi, 24)
+    except Exception:
+        return []
+
+    return [float(x) for x in grid if math.isfinite(float(x)) and float(x) > 0]
+
+
+def _fit_transient_models_for_component(
+    df: pd.DataFrame,
+    component: str,
+    x_series: pd.Series,
+    x0: float,
+    x1: float,
+    gaussian_width_days: float,
+) -> pd.DataFrame:
+    if component not in df.columns:
+        return pd.DataFrame()
+
+    if not math.isfinite(x0) or not math.isfinite(x1) or x1 <= x0:
+        return pd.DataFrame()
+
+    y_smooth = _gaussian_smoothed_enu_series_for_plot(
+        df=df,
+        column=component,
+        x_series=x_series,
+        gaussian_width_days=gaussian_width_days,
+    )
+
+    if y_smooth is None:
+        y_smooth = pd.to_numeric(df[component], errors="coerce")
+
+    x = pd.to_numeric(x_series, errors="coerce")
+    y = pd.to_numeric(y_smooth, errors="coerce") * 1000.0
+
+    mask = (x >= x0) & (x <= x1) & x.notna() & y.notna()
+
+    xw = x.loc[mask].to_numpy(dtype=float)
+    yw = y.loc[mask].to_numpy(dtype=float)
+
+    if len(xw) < 10:
+        return pd.DataFrame()
+
+    t_days = (xw - float(x0)) * 365.25
+    duration_days = float((float(x1) - float(x0)) * 365.25)
+
+    rows = []
+
+    for model_name in ["linear", "quadratic"]:
+        fit = _fit_transient_model_least_squares(
+            t_days=t_days,
+            y_mm=yw,
+            model_name=model_name,
+            tau_days=None,
+        )
+
+        if fit.get("ok", False):
+            rows.append(fit)
+
+    for model_name in []:  # exponential/logarithmic disabled; quadratic-only transient model
+        best = None
+
+        for tau in _tau_grid_for_transient_fit(duration_days):
+            fit = _fit_transient_model_least_squares(
+                t_days=t_days,
+                y_mm=yw,
+                model_name=model_name,
+                tau_days=tau,
+            )
+
+            if not fit.get("ok", False):
+                continue
+
+            if best is None or float(fit["bic"]) < float(best["bic"]):
+                best = fit
+
+        if best is not None:
+            rows.append(best)
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows)
+    out["component"] = component
+    out["duration_days"] = duration_days
+
+    best_bic = float(out["bic"].min())
+
+    out["delta_bic_from_best"] = out["bic"] - best_bic
+    out["best_by_bic"] = out["bic"] == best_bic
+
+    return out.sort_values(["best_by_bic", "bic"], ascending=[False, True]).reset_index(drop=True)
+
+
+def _compute_transient_model_fits(
+    df: pd.DataFrame,
+    transient_windows: pd.DataFrame,
+    report_analysis_config: dict | None = None,
+) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+
+    if transient_windows is None or len(transient_windows) == 0:
+        return pd.DataFrame()
+
+    required = {
+        "window_type",
+        "start_decimal_year",
+        "end_decimal_year",
+    }
+
+    if not required.issubset(set(transient_windows.columns)):
+        return pd.DataFrame()
+
+    analysis_cfg = _resolve_report_analysis_config(report_analysis_config)
+    plot_cfg = analysis_cfg.get("plots", {})
+    gaussian_width_days = float(plot_cfg.get("gaussian_width_days", 28.0))
+
+    x_series, _ = _decimal_year_series_for_composite_plot(df)
+
+    rows = []
+
+    work = transient_windows.copy()
+    work = work[work["window_type"].astype(str).isin(["pre_event_transient", "post_event_transient"])].copy()
+
+    if len(work) == 0:
+        return pd.DataFrame()
+
+    for _, window in work.iterrows():
+        try:
+            x0 = float(window.get("start_decimal_year", math.nan))
+            x1 = float(window.get("end_decimal_year", math.nan))
+        except Exception:
+            continue
+
+        for component in ["E_m", "N_m", "U_m"]:
+            fits = _fit_transient_models_for_component(
+                df=df,
+                component=component,
+                x_series=x_series,
+                x0=x0,
+                x1=x1,
+                gaussian_width_days=gaussian_width_days,
+            )
+
+            if fits is None or len(fits) == 0:
+                continue
+
+            for _, fit in fits.iterrows():
+                row = fit.to_dict()
+
+                row["meta_cluster_id"] = window.get("meta_cluster_id", "")
+                row["window_type"] = window.get("window_type", "")
+                row["start_decimal_year"] = x0
+                row["end_decimal_year"] = x1
+                row["start_date"] = window.get("start_date", "")
+                row["end_date"] = window.get("end_date", "")
+                row["gaussian_width_days"] = gaussian_width_days
+
+                rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows)
+
+    order_cols = [
+        "meta_cluster_id",
+        "window_type",
+        "component",
+        "best_by_bic",
+        "bic",
+    ]
+
+    existing_order = [col for col in order_cols if col in out.columns]
+
+    if existing_order:
+        out = out.sort_values(existing_order, ascending=[True, True, True, False, True]).reset_index(drop=True)
+
+    return out
+
+
+
+def _fit_joint_horizontal_transient_model(
+    t_days: np.ndarray,
+    e_mm: np.ndarray,
+    n_mm: np.ndarray,
+    model_name: str,
+    tau_days: float | None = None,
+) -> dict:
+    X, names = _transient_fit_design_matrix(t_days, model_name, tau_days=tau_days)
+
+    if X is None or len(names) == 0:
+        return {"ok": False, "reason": "invalid_design_matrix"}
+
+    n_obs = int(len(t_days))
+    p = int(X.shape[1])
+
+    if n_obs <= p + 1:
+        return {"ok": False, "reason": "insufficient_points"}
+
+    try:
+        beta_e, _, rank_e, _ = np.linalg.lstsq(X, e_mm, rcond=None)
+        beta_n, _, rank_n, _ = np.linalg.lstsq(X, n_mm, rcond=None)
+    except Exception as exc:
+        return {"ok": False, "reason": f"least_squares_failed: {exc}"}
+
+    if rank_e < p or rank_n < p:
+        return {"ok": False, "reason": "rank_deficient"}
+
+    e_hat = X @ beta_e
+    n_hat = X @ beta_n
+
+    res_e = e_mm - e_hat
+    res_n = n_mm - n_hat
+
+    rss_e = float(np.sum(res_e ** 2))
+    rss_n = float(np.sum(res_n ** 2))
+    rss_total = rss_e + rss_n
+
+    n_total = int(2 * n_obs)
+
+    # Separate E and N coefficient vectors plus one effective tau parameter for nonlinear grid models.
+    k_total = int(2 * p + (1 if model_name in {"exponential", "logarithmic"} else 0))
+
+    rss_for_ic = max(rss_total, 1.0e-12)
+
+    rms_e = float(math.sqrt(rss_e / n_obs))
+    rms_n = float(math.sqrt(rss_n / n_obs))
+    rms_h = float(math.sqrt(rss_total / n_total))
+
+    aic = float(n_total * math.log(rss_for_ic / n_total) + 2 * k_total)
+    bic = float(n_total * math.log(rss_for_ic / n_total) + k_total * math.log(n_total))
+
+    out = {
+        "ok": True,
+        "model_name": model_name,
+        "tau_days": float(tau_days) if tau_days is not None else math.nan,
+        "n_points_per_component": n_obs,
+        "n_total_observations": n_total,
+        "n_parameters_total": k_total,
+        "rss_E_mm2": rss_e,
+        "rss_N_mm2": rss_n,
+        "rss_horizontal_total_mm2": rss_total,
+        "rms_E_mm": rms_e,
+        "rms_N_mm": rms_n,
+        "rms_horizontal_mm": rms_h,
+        "aic_joint": aic,
+        "bic_joint": bic,
+        "reason": "",
+    }
+
+    for name, value in zip(names, beta_e):
+        out[f"E_{name}"] = float(value)
+
+    for name, value in zip(names, beta_n):
+        out[f"N_{name}"] = float(value)
+
+    for prefix in ["E", "N"]:
+        for name in [
+            "intercept_mm",
+            "linear_mm_per_day",
+            "quadratic_mm_per_day2",
+            "amplitude_mm",
+        ]:
+            key = f"{prefix}_{name}"
+            if key not in out:
+                out[key] = math.nan
+
+    return out
+
+
+def _fit_joint_horizontal_transient_models_for_window(
+    df: pd.DataFrame,
+    x_series: pd.Series,
+    x0: float,
+    x1: float,
+    gaussian_width_days: float,
+) -> pd.DataFrame:
+    if "E_m" not in df.columns or "N_m" not in df.columns:
+        return pd.DataFrame()
+
+    if not math.isfinite(x0) or not math.isfinite(x1) or x1 <= x0:
+        return pd.DataFrame()
+
+    e_smooth = _gaussian_smoothed_enu_series_for_plot(
+        df=df,
+        column="E_m",
+        x_series=x_series,
+        gaussian_width_days=gaussian_width_days,
+    )
+
+    n_smooth = _gaussian_smoothed_enu_series_for_plot(
+        df=df,
+        column="N_m",
+        x_series=x_series,
+        gaussian_width_days=gaussian_width_days,
+    )
+
+    if e_smooth is None:
+        e_smooth = pd.to_numeric(df["E_m"], errors="coerce")
+
+    if n_smooth is None:
+        n_smooth = pd.to_numeric(df["N_m"], errors="coerce")
+
+    x = pd.to_numeric(x_series, errors="coerce")
+    e = pd.to_numeric(e_smooth, errors="coerce") * 1000.0
+    n = pd.to_numeric(n_smooth, errors="coerce") * 1000.0
+
+    mask = (
+        (x >= x0)
+        & (x <= x1)
+        & x.notna()
+        & e.notna()
+        & n.notna()
+    )
+
+    xw = x.loc[mask].to_numpy(dtype=float)
+    ew = e.loc[mask].to_numpy(dtype=float)
+    nw = n.loc[mask].to_numpy(dtype=float)
+
+    if len(xw) < 10:
+        return pd.DataFrame()
+
+    t_days = (xw - float(x0)) * 365.25
+    duration_days = float((float(x1) - float(x0)) * 365.25)
+
+    rows = []
+
+    for model_name in ["linear", "quadratic"]:
+        fit = _fit_joint_horizontal_transient_model(
+            t_days=t_days,
+            e_mm=ew,
+            n_mm=nw,
+            model_name=model_name,
+            tau_days=None,
+        )
+
+        if fit.get("ok", False):
+            rows.append(fit)
+
+    for model_name in []:  # exponential/logarithmic disabled; quadratic-only transient model
+        best = None
+
+        for tau in _tau_grid_for_transient_fit(duration_days):
+            fit = _fit_joint_horizontal_transient_model(
+                t_days=t_days,
+                e_mm=ew,
+                n_mm=nw,
+                model_name=model_name,
+                tau_days=tau,
+            )
+
+            if not fit.get("ok", False):
+                continue
+
+            if best is None or float(fit["bic_joint"]) < float(best["bic_joint"]):
+                best = fit
+
+        if best is not None:
+            rows.append(best)
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows)
+    out["duration_days"] = duration_days
+
+    best_bic = float(out["bic_joint"].min())
+
+    out["delta_bic_from_best"] = out["bic_joint"] - best_bic
+    out["best_by_bic"] = out["bic_joint"] == best_bic
+
+    return out.sort_values(["best_by_bic", "bic_joint"], ascending=[False, True]).reset_index(drop=True)
+
+
+def _compute_joint_horizontal_transient_model_fits(
+    df: pd.DataFrame,
+    transient_windows: pd.DataFrame,
+    report_analysis_config: dict | None = None,
+) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+
+    if transient_windows is None or len(transient_windows) == 0:
+        return pd.DataFrame()
+
+    required = {
+        "window_type",
+        "start_decimal_year",
+        "end_decimal_year",
+    }
+
+    if not required.issubset(set(transient_windows.columns)):
+        return pd.DataFrame()
+
+    analysis_cfg = _resolve_report_analysis_config(report_analysis_config)
+    plot_cfg = analysis_cfg.get("plots", {})
+    gaussian_width_days = float(plot_cfg.get("gaussian_width_days", 28.0))
+
+    x_series, _ = _decimal_year_series_for_composite_plot(df)
+
+    rows = []
+
+    work = transient_windows.copy()
+    work = work[work["window_type"].astype(str).isin(["pre_event_transient", "post_event_transient"])].copy()
+
+    if len(work) == 0:
+        return pd.DataFrame()
+
+    for _, window in work.iterrows():
+        try:
+            x0 = float(window.get("start_decimal_year", math.nan))
+            x1 = float(window.get("end_decimal_year", math.nan))
+        except Exception:
+            continue
+
+        fits = _fit_joint_horizontal_transient_models_for_window(
+            df=df,
+            x_series=x_series,
+            x0=x0,
+            x1=x1,
+            gaussian_width_days=gaussian_width_days,
+        )
+
+        if fits is None or len(fits) == 0:
+            continue
+
+        for _, fit in fits.iterrows():
+            row = fit.to_dict()
+
+            row["meta_cluster_id"] = window.get("meta_cluster_id", "")
+            row["window_type"] = window.get("window_type", "")
+            row["start_decimal_year"] = x0
+            row["end_decimal_year"] = x1
+            row["start_date"] = window.get("start_date", "")
+            row["end_date"] = window.get("end_date", "")
+            row["gaussian_width_days"] = gaussian_width_days
+
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows)
+
+    order_cols = [
+        "meta_cluster_id",
+        "window_type",
+        "best_by_bic",
+        "bic_joint",
+    ]
+
+    existing_order = [col for col in order_cols if col in out.columns]
+
+    out = _add_joint_horizontal_interpretation_flags(out)
+
+    if existing_order:
+        out = out.sort_values(existing_order, ascending=[True, True, False, True]).reset_index(drop=True)
+
+    return out
+
+
+
+def _bic_preference_strength(delta_bic: float) -> str:
+    try:
+        value = float(delta_bic)
+    except Exception:
+        return "undefined"
+
+    if not math.isfinite(value):
+        return "undefined"
+
+    if value >= 10.0:
+        return "strong"
+
+    if value >= 6.0:
+        return "moderate"
+
+    if value >= 2.0:
+        return "weak"
+
+    return "negligible"
+
+
+def _joint_horizontal_interpretation_class(window_type: str, model_name: str) -> str:
+    window_type = str(window_type)
+    model_name = str(model_name)
+
+    if window_type == "pre_event_transient":
+        if model_name == "quadratic":
+            return "pre_event_horizontal_acceleration"
+        if model_name in {"exponential", "logarithmic"}:
+            return "pre_event_horizontal_nonlinear_transient"
+        if model_name == "linear":
+            return "pre_event_linear_background"
+        return "pre_event_unclassified"
+
+    if window_type == "post_event_transient":
+        if model_name in {"exponential", "logarithmic"}:
+            return "post_event_horizontal_relaxation"
+        if model_name == "quadratic":
+            return "post_event_horizontal_curvature"
+        if model_name == "linear":
+            return "post_event_linear_background"
+        return "post_event_unclassified"
+
+    return "unclassified"
+
+
+def _tau_resolution_flag(
+    model_name: str,
+    tau_days,
+    gaussian_width_days,
+    duration_days,
+) -> str:
+    model_name = str(model_name)
+
+    if model_name not in {"exponential", "logarithmic"}:
+        return "not_applicable"
+
+    try:
+        tau = float(tau_days)
+    except Exception:
+        return "undefined"
+
+    try:
+        gw = float(gaussian_width_days)
+    except Exception:
+        gw = math.nan
+
+    try:
+        duration = float(duration_days)
+    except Exception:
+        duration = math.nan
+
+    if not math.isfinite(tau) or tau <= 0:
+        return "invalid_tau"
+
+    if math.isfinite(gw) and tau < gw:
+        return "tau_shorter_than_gaussian_width"
+
+    if math.isfinite(duration) and tau > duration:
+        return "tau_longer_than_window"
+
+    return "tau_resolved"
+
+
+def _add_joint_horizontal_interpretation_flags(joint_fits: pd.DataFrame) -> pd.DataFrame:
+    if joint_fits is None or len(joint_fits) == 0:
+        return pd.DataFrame()
+
+    out = joint_fits.copy()
+
+    for col in [
+        "bic_preference_margin_to_second",
+        "model_preference_strength",
+        "horizontal_interpretation_class",
+        "physical_interpretation_flag",
+        "tau_resolution_flag",
+    ]:
+        if col not in out.columns:
+            out[col] = ""
+
+    required = {"meta_cluster_id", "window_type", "model_name", "bic_joint"}
+
+    if not required.issubset(set(out.columns)):
+        return out
+
+    for _, group in out.groupby(["meta_cluster_id", "window_type"], dropna=False):
+        if len(group) == 0:
+            continue
+
+        sorted_group = group.sort_values("bic_joint")
+
+        best_idx = sorted_group.index[0]
+        best_bic = float(sorted_group.iloc[0]["bic_joint"])
+
+        if len(sorted_group) >= 2:
+            second_bic = float(sorted_group.iloc[1]["bic_joint"])
+            margin = second_bic - best_bic
+        else:
+            margin = math.nan
+
+        strength = _bic_preference_strength(margin)
+
+        for idx, row in group.iterrows():
+            is_best = bool(row.get("best_by_bic", False))
+
+            model_name = str(row.get("model_name", ""))
+            window_type = str(row.get("window_type", ""))
+
+            interpretation_class = _joint_horizontal_interpretation_class(
+                window_type=window_type,
+                model_name=model_name,
+            )
+
+            tau_flag = _tau_resolution_flag(
+                model_name=model_name,
+                tau_days=row.get("tau_days", math.nan),
+                gaussian_width_days=row.get("gaussian_width_days", math.nan),
+                duration_days=row.get("duration_days", math.nan),
+            )
+
+            out.loc[idx, "bic_preference_margin_to_second"] = margin if is_best else math.nan
+            out.loc[idx, "model_preference_strength"] = strength if is_best else "not_selected"
+            out.loc[idx, "horizontal_interpretation_class"] = interpretation_class
+
+            if not is_best:
+                out.loc[idx, "physical_interpretation_flag"] = "not_selected"
+            elif strength in {"strong", "moderate"} and tau_flag not in {"tau_shorter_than_gaussian_width", "invalid_tau"}:
+                out.loc[idx, "physical_interpretation_flag"] = "primary_horizontal_interpretation"
+            elif strength in {"strong", "moderate"} and tau_flag == "tau_shorter_than_gaussian_width":
+                out.loc[idx, "physical_interpretation_flag"] = "primary_model_but_tau_weakly_resolved"
+            elif strength == "weak":
+                out.loc[idx, "physical_interpretation_flag"] = "weak_model_preference"
+            else:
+                out.loc[idx, "physical_interpretation_flag"] = "diagnostic_only"
+
+            out.loc[idx, "tau_resolution_flag"] = tau_flag
+
+    return out
+
+def _joint_horizontal_transient_model_fits_html(joint_fits: pd.DataFrame) -> str:
+    text = ["<h3>Joint horizontal transient model fit diagnostics</h3>"]
+
+    if joint_fits is None or len(joint_fits) == 0:
+        text.append("<p>No joint horizontal transient model fits were generated.</p>")
+        return chr(10).join(text)
+
+    text.append(
+        "<p>Joint horizontal transient fits use E and N together over the same automatically inferred transient windows. "
+        "Only two models are evaluated: a linear reference model and a quadratic transient diagnostic model. "
+        "Model comparison is based on joint horizontal BIC using RSS<sub>total</sub> = RSS<sub>E</sub> + RSS<sub>N</sub>. "
+        "This table is the primary source for horizontal transient model selection. "
+        "No exponential/logarithmic time-scale parameter is estimated in the current method.</p>"
+    )
+
+    best = joint_fits[joint_fits.get("best_by_bic", False) == True].copy()
+
+    if len(best) > 0:
+        text.append("<h4>Primary horizontal transient model selection</h4>")
+
+        best_cols = [
+            "meta_cluster_id",
+            "window_type",
+            "model_name",
+            "horizontal_interpretation_class",
+            "physical_interpretation_flag",
+            "model_preference_strength",
+            "duration_days",
+            "rms_horizontal_mm",
+            "bic_joint",
+            "bic_preference_margin_to_second",
+            "E_linear_mm_per_day",
+            "N_linear_mm_per_day",
+            "E_quadratic_mm_per_day2",
+            "N_quadratic_mm_per_day2",
+        ]
+
+        best_existing = [col for col in best_cols if col in best.columns]
+
+        best_headers = [
+            "Meta ID",
+            "Window type",
+            "Best model",
+            "Interpretation class",
+            "Physical interpretation flag",
+            "Preference strength",
+            "Duration (days)",
+            "RMS horizontal (mm)",
+            "BIC joint",
+            "BIC margin to second",
+            "E linear (mm/day)",
+            "N linear (mm/day)",
+            "E quadratic (mm/day²)",
+            "N quadratic (mm/day²)",
+        ][:len(best_existing)]
+
+        best_rows = []
+
+        for _, item in best.iterrows():
+            row = []
+
+            for col in best_existing:
+                value = item.get(col, "")
+
+                if col in {
+                    "duration_days",
+                    "rms_horizontal_mm",
+                    "bic_joint",
+                    "delta_bic_from_best",
+                    "E_linear_mm_per_day",
+                    "N_linear_mm_per_day",
+                    "E_quadratic_mm_per_day2",
+                    "N_quadratic_mm_per_day2",
+                    "E_amplitude_mm",
+                    "N_amplitude_mm",
+                    "tau_days",
+                }:
+                    value = _fmt(value, digits=4)
+
+                row.append(_html_escape(value))
+
+            best_rows.append(row)
+
+        text.append(_html_table(best_headers, best_rows))
+
+    cols = [
+        "meta_cluster_id",
+        "window_type",
+        "model_name",
+        "best_by_bic",
+        "start_decimal_year",
+        "end_decimal_year",
+        "start_date",
+        "end_date",
+        "duration_days",
+        "n_points_per_component",
+        "n_parameters_total",
+        "rms_E_mm",
+        "rms_N_mm",
+        "rms_horizontal_mm",
+        "aic_joint",
+        "bic_joint",
+        "delta_bic_from_best",
+        "E_linear_mm_per_day",
+        "N_linear_mm_per_day",
+        "E_quadratic_mm_per_day2",
+        "N_quadratic_mm_per_day2",
+        "gaussian_width_days",
+    ]
+
+    existing = [col for col in cols if col in joint_fits.columns]
+
+    headers = [
+        "Meta ID",
+        "Window type",
+        "Model",
+        "Best by BIC",
+        "Start decimal year",
+        "End decimal year",
+        "Start date",
+        "End date",
+        "Duration (days)",
+        "N/component",
+        "k total",
+        "RMS E (mm)",
+        "RMS N (mm)",
+        "RMS horizontal (mm)",
+        "AIC joint",
+        "BIC joint",
+        "ΔBIC",
+        "E linear (mm/day)",
+        "N linear (mm/day)",
+        "E quadratic (mm/day²)",
+        "N quadratic (mm/day²)",
+        "Gaussian width (days)",
+    ][:len(existing)]
+
+    rows = []
+
+    for _, item in joint_fits.iterrows():
+        row = []
+
+        for col in existing:
+            value = item.get(col, "")
+
+            if col in {
+                "start_decimal_year",
+                "end_decimal_year",
+            }:
+                value = _fmt(value, digits=6)
+            elif col in {
+                "duration_days",
+                "rms_E_mm",
+                "rms_N_mm",
+                "rms_horizontal_mm",
+                "aic_joint",
+                "bic_joint",
+                "delta_bic_from_best",
+                "E_linear_mm_per_day",
+                "N_linear_mm_per_day",
+                "E_quadratic_mm_per_day2",
+                "N_quadratic_mm_per_day2",
+                "E_amplitude_mm",
+                "N_amplitude_mm",
+                "tau_days",
+                "gaussian_width_days",
+            }:
+                value = _fmt(value, digits=4)
+
+            row.append(_html_escape(value))
+
+        rows.append(row)
+
+    text.append(_html_table(headers, rows))
+
+    return chr(10).join(text)
+
+def _transient_model_fits_html(transient_model_fits: pd.DataFrame) -> str:
+    text = ["<h3>Component-wise transient model fit diagnostics (secondary)</h3>"]
+
+    if transient_model_fits is None or len(transient_model_fits) == 0:
+        text.append("<p>No transient model fits were generated.</p>")
+        return chr(10).join(text)
+
+    text.append(
+        "<p>These component-wise transient fits are secondary diagnostics. "
+        "For E/N horizontal transient model selection, use the joint horizontal transient model table above. "
+        "Only a linear reference model and a quadratic transient diagnostic model are evaluated. "
+        "The component-wise E/N fits are retained only to inspect residual behaviour by component. "
+        "U fits are diagnostic-only. No fitted transient model is drawn in the ENU composite plot at this stage.</p>"
+    )
+
+    cols = [
+        "meta_cluster_id",
+        "window_type",
+        "component",
+        "model_name",
+        "best_by_bic",
+        "start_decimal_year",
+        "end_decimal_year",
+        "start_date",
+        "end_date",
+        "duration_days",
+        "n_points",
+        "n_parameters",
+        "rms_mm",
+        "aic",
+        "bic",
+        "delta_bic_from_best",
+        "intercept_mm",
+        "linear_mm_per_day",
+        "quadratic_mm_per_day2",
+        "gaussian_width_days",
+    ]
+
+    existing = [col for col in cols if col in transient_model_fits.columns]
+
+    headers = [
+        "Meta ID",
+        "Window type",
+        "Component",
+        "Model",
+        "Best by BIC",
+        "Start decimal year",
+        "End decimal year",
+        "Start date",
+        "End date",
+        "Duration (days)",
+        "N",
+        "k",
+        "RMS (mm)",
+        "AIC",
+        "BIC",
+        "ΔBIC",
+        "Intercept (mm)",
+        "Linear (mm/day)",
+        "Quadratic (mm/day²)",
+        "Gaussian width (days)",
+    ][:len(existing)]
+
+    rows = []
+
+    for _, item in transient_model_fits.iterrows():
+        row = []
+
+        for col in existing:
+            value = item.get(col, "")
+
+            if col in {
+                "start_decimal_year",
+                "end_decimal_year",
+            }:
+                value = _fmt(value, digits=6)
+            elif col in {
+                "duration_days",
+                "rms_mm",
+                "aic",
+                "bic",
+                "delta_bic_from_best",
+                "intercept_mm",
+                "linear_mm_per_day",
+                "quadratic_mm_per_day2",
+                "gaussian_width_days",
+            }:
+                value = _fmt(value, digits=4)
+
+            row.append(_html_escape(value))
+
+        rows.append(row)
+
+    text.append(_html_table(headers, rows))
+
+    return chr(10).join(text)
+
+def _transient_windows_html(transient_windows: pd.DataFrame) -> str:
+    text = ["<h3>Automatic pre/event/post transient windows</h3>"]
+
+    if transient_windows is None or len(transient_windows) == 0:
+        text.append("<p>No automatic transient windows were generated.</p>")
+        return chr(10).join(text)
+
+    text.append(
+        "<p>Event/incidence intervals are not treated as stable velocity intervals. "
+        "They are reported as net displacement and deformation rate during incidence. "
+        "Pre- and post-event transient windows are inferred automatically from shift-related report-grade horizontal velocity-change clusters "
+        "and are excluded from stable rolling/sliding velocity interpretation.</p>"
+    )
+
+    cols = [
+        "meta_cluster_id",
+        "window_type",
+        "source",
+        "start_decimal_year",
+        "end_decimal_year",
+        "start_date",
+        "end_date",
+        "duration_days",
+        "E_m_net_mm",
+        "N_m_net_mm",
+        "U_m_net_mm",
+        "H_net_mm",
+        "E_m_range_mm",
+        "N_m_range_mm",
+        "U_m_range_mm",
+        "E_m_rate_mm_per_day",
+        "N_m_rate_mm_per_day",
+        "U_m_rate_mm_per_day",
+        "H_rate_mm_per_day",
+        "interpretation",
+    ]
+
+    existing = [col for col in cols if col in transient_windows.columns]
+
+    headers = [
+        "Meta ID",
+        "Window type",
+        "Source",
+        "Start decimal year",
+        "End decimal year",
+        "Start date",
+        "End date",
+        "Duration (days)",
+        "E net (mm)",
+        "N net (mm)",
+        "U net (mm)",
+        "H net (mm)",
+        "E range (mm)",
+        "N range (mm)",
+        "U range (mm)",
+        "E incidence rate (mm/day)",
+        "N incidence rate (mm/day)",
+        "U incidence rate (mm/day)",
+        "H incidence rate (mm/day)",
+        "Interpretation",
+    ][:len(existing)]
+
+    rows = []
+
+    for _, item in transient_windows.iterrows():
+        row = []
+
+        for col in existing:
+            value = item.get(col, "")
+
+            if col in {
+                "start_decimal_year",
+                "end_decimal_year",
+            }:
+                value = _fmt(value, digits=6)
+            elif col in {
+                "duration_days",
+                "E_m_net_mm",
+                "N_m_net_mm",
+                "U_m_net_mm",
+                "H_net_mm",
+                "E_m_range_mm",
+                "N_m_range_mm",
+                "U_m_range_mm",
+                "E_m_rate_mm_per_day",
+                "N_m_rate_mm_per_day",
+                "U_m_rate_mm_per_day",
+                "H_rate_mm_per_day",
+            }:
+                value = _fmt(value, digits=3)
+
+            row.append(_html_escape(value))
+
+        rows.append(row)
+
+    text.append(_html_table(headers, rows))
+
+    return chr(10).join(text)
+
+def _compute_velocity_change_diagnostics(
+    df: pd.DataFrame,
+    meta_clusters: pd.DataFrame,
+    report_analysis_config: dict | None = None,
+) -> dict:
+    empty = {
+        "rolling": pd.DataFrame(),
+        "changes": pd.DataFrame(),
+        "clusters": pd.DataFrame(),
+        "classified": pd.DataFrame(),
+        "enabled": False,
+        "error": "",
+    }
+
+    if df is None or len(df) == 0:
+        return empty
+
+    analysis_cfg = _resolve_report_analysis_config(report_analysis_config)
+    vc_cfg = analysis_cfg.get("rolling_velocity_diagnostics", {})
+
+    if not bool(vc_cfg.get("enabled", True)):
+        return empty
+
+    try:
+        import timeseries_velocity_detection as tvd
+    except Exception as exc:
+        out = empty.copy()
+        out["error"] = f"timeseries_velocity_detection import failed: {exc}"
+        return out
+
+    required_names = [
+        "RollingVelocityDiagnosticConfig",
+        "compute_rolling_velocity_diagnostics",
+        "cluster_persistent_velocity_changes_v1",
+        "classify_velocity_change_clusters_against_meta_clusters_v1",
+    ]
+
+    for name in required_names:
+        if not hasattr(tvd, name):
+            out = empty.copy()
+            out["error"] = f"timeseries_velocity_detection missing required function/class: {name}"
+            return out
+
+    try:
+        cfg = tvd.RollingVelocityDiagnosticConfig(
+            columns=("E_m", "N_m", "U_m"),
+            window_days=float(vc_cfg.get("window_days", 182.0)),
+            step_days=float(vc_cfg.get("step_days", 7.0)),
+            comparison_lag_days=float(vc_cfg.get("comparison_lag_days", 91.0)),
+            min_points_per_window=int(vc_cfg.get("min_points_per_window", 20)),
+            apply_gaussian_smoothing=bool(vc_cfg.get("apply_gaussian_smoothing", True)),
+            gaussian_width_days=float(vc_cfg.get("gaussian_width_days", 28.0)),
+            significance_z_threshold=float(vc_cfg.get("significance_z_threshold", 4.0)),
+            min_abs_delta_velocity_mm_per_year=float(vc_cfg.get("min_abs_delta_velocity_mm_per_year", 1.0)),
+            minimum_persistence_fraction_of_window=float(vc_cfg.get("minimum_persistence_fraction_of_window", 0.5)),
+            horizontal_coherence_required=bool(vc_cfg.get("horizontal_coherence_required", True)),
+            meta_association_window_days=vc_cfg.get("meta_association_window_days", None),
+            include_horizontal_vector=bool(vc_cfg.get("include_horizontal_vector", True)),
+        )
+
+        rolling, changes = tvd.compute_rolling_velocity_diagnostics(df, cfg)
+        clusters = tvd.cluster_persistent_velocity_changes_v1(changes, cfg)
+        classified = tvd.classify_velocity_change_clusters_against_meta_clusters_v1(
+            velocity_clusters=clusters,
+            meta_clusters=meta_clusters,
+            cfg=cfg,
+        )
+
+        transient_windows = _compute_transient_windows_from_velocity_change_clusters(
+            df=df,
+            meta_clusters=meta_clusters,
+            velocity_change_diagnostics={"classified": classified},
+            report_analysis_config=analysis_cfg,
+        )
+
+        transient_model_fits = _compute_transient_model_fits(
+            df=df,
+            transient_windows=transient_windows,
+            report_analysis_config=analysis_cfg,
+        )
+
+        joint_horizontal_transient_model_fits = _compute_joint_horizontal_transient_model_fits(
+            df=df,
+            transient_windows=transient_windows,
+            report_analysis_config=analysis_cfg,
+        )
+
+        return {
+            "rolling": rolling,
+            "changes": changes,
+            "clusters": clusters,
+            "classified": classified,
+            "transient_windows": transient_windows,
+            "transient_model_fits": transient_model_fits,
+            "joint_horizontal_transient_model_fits": joint_horizontal_transient_model_fits,
+            "enabled": True,
+            "error": "",
+            "config": {
+                "window_days": float(cfg.window_days),
+                "step_days": float(cfg.step_days),
+                "comparison_lag_days": float(cfg.comparison_lag_days),
+                "significance_z_threshold": float(cfg.significance_z_threshold),
+                "min_abs_delta_velocity_mm_per_year": float(cfg.min_abs_delta_velocity_mm_per_year),
+                "minimum_persistence_fraction_of_window": float(cfg.minimum_persistence_fraction_of_window),
+                "minimum_persistence_days": float(cfg.minimum_persistence_fraction_of_window) * float(cfg.window_days),
+                "gaussian_width_days": float(cfg.gaussian_width_days),
+                "horizontal_coherence_required": bool(cfg.horizontal_coherence_required),
+            },
+        }
+
+    except Exception as exc:
+        out = empty.copy()
+        out["enabled"] = True
+        out["error"] = str(exc)
+        return out
+
+
+def _velocity_change_table_html(
+    df: pd.DataFrame,
+    title: str,
+    max_rows: int = 50,
+) -> str:
+    text = [f"<h3>{_html_escape(title)}</h3>"]
+
+    if df is None or len(df) == 0:
+        text.append("<p>No rows.</p>")
+        return chr(10).join(text)
+
+    cols = [
+        "velocity_change_cluster_id",
+        "component",
+        "shift_context_class",
+        "report_grade",
+        "shift_related_velocity_change",
+        "nearest_meta_relation",
+        "nearest_meta_gap_days",
+        "nearest_meta_overlap_days",
+        "cluster_start_decimal_year",
+        "cluster_end_decimal_year",
+        "cluster_duration_days",
+        "n_consecutive_centers",
+        "minimum_required_centers",
+        "representative_center_decimal_year",
+        "representative_delta_velocity_mm_per_year",
+        "representative_sigma_delta_velocity_mm_per_year",
+        "max_abs_delta_velocity_mm_per_year",
+        "max_velocity_change_z",
+        "horizontal_support_components",
+    ]
+
+    existing = [col for col in cols if col in df.columns]
+
+    headers = [
+        "Cluster",
+        "Component",
+        "Context class",
+        "Report-grade",
+        "Shift-related",
+        "Meta relation",
+        "Meta gap (days)",
+        "Meta overlap (days)",
+        "Start decimal year",
+        "End decimal year",
+        "Duration (days)",
+        "Consecutive centers",
+        "Required centers",
+        "Representative center",
+        "Representative Δv (mm/yr)",
+        "σΔv (mm/yr)",
+        "Max |Δv| (mm/yr)",
+        "Max Z",
+        "Horizontal support",
+    ][:len(existing)]
+
+    rows = []
+
+    for _, item in df.head(max_rows).iterrows():
+        row = []
+
+        for col in existing:
+            value = item.get(col, "")
+
+            if col in {
+                "cluster_start_decimal_year",
+                "cluster_end_decimal_year",
+                "representative_center_decimal_year",
+            }:
+                value = _fmt(value, digits=4)
+            elif col in {
+                "nearest_meta_gap_days",
+                "nearest_meta_overlap_days",
+                "cluster_duration_days",
+                "representative_delta_velocity_mm_per_year",
+                "representative_sigma_delta_velocity_mm_per_year",
+                "max_abs_delta_velocity_mm_per_year",
+                "max_velocity_change_z",
+            }:
+                value = _fmt(value, digits=3)
+
+            row.append(_html_escape(value))
+
+        rows.append(row)
+
+    text.append(_html_table(headers, rows))
+
+    if len(df) > max_rows:
+        text.append(f"<p>Table truncated to first {max_rows} rows out of {len(df)}.</p>")
+
+    return chr(10).join(text)
+
+
+def _velocity_change_diagnostics_html(result: dict) -> str:
+    if result is None:
+        return "<p>No velocity-change diagnostic result.</p>"
+
+    if not result.get("enabled", False):
+        return "<p>Rolling velocity-change diagnostics are disabled.</p>"
+
+    if result.get("error"):
+        return f"<p>Velocity-change diagnostics failed: {_html_escape(result.get('error'))}</p>"
+
+    rolling = result.get("rolling", pd.DataFrame())
+    changes = result.get("changes", pd.DataFrame())
+    classified = result.get("classified", pd.DataFrame())
+    cfg = result.get("config", {})
+
+    text = []
+
+    text.append(
+        "<p>This section reports rolling velocity-change diagnostics. "
+        "The diagnostic first estimates local velocities in moving windows, compares each window against a previous reference window, "
+        "keeps only persistent changes, and then classifies persistent velocity-change clusters relative to the detected displacement meta-clusters. "
+        "U-only changes are retained as diagnostic-only and are not treated as report-grade horizontal velocity changes.</p>"
+    )
+
+    parameter_rows = [
+        ["rolling_window_days", _fmt(cfg.get("window_days", math.nan), digits=3)],
+        ["rolling_step_days", _fmt(cfg.get("step_days", math.nan), digits=3)],
+        ["comparison_lag_days", _fmt(cfg.get("comparison_lag_days", math.nan), digits=3)],
+        ["Z_threshold", _fmt(cfg.get("significance_z_threshold", math.nan), digits=3)],
+        ["min_abs_delta_velocity_mm_per_year", _fmt(cfg.get("min_abs_delta_velocity_mm_per_year", math.nan), digits=3)],
+        ["minimum_persistence_fraction_of_window", _fmt(cfg.get("minimum_persistence_fraction_of_window", math.nan), digits=3)],
+        ["minimum_persistence_days", _fmt(cfg.get("minimum_persistence_days", math.nan), digits=3)],
+        ["gaussian_width_days", _fmt(cfg.get("gaussian_width_days", math.nan), digits=3)],
+        ["horizontal_coherence_required", _html_escape(cfg.get("horizontal_coherence_required", ""))],
+        ["rolling_velocity_rows", _html_escape(len(rolling))],
+        ["velocity_change_rows", _html_escape(len(changes))],
+        ["persistent_velocity_change_clusters", _html_escape(len(classified))],
+    ]
+
+    if len(classified) > 0 and "report_grade" in classified.columns:
+        parameter_rows.append(["report_grade_clusters", _html_escape(int(classified["report_grade"].sum()))])
+
+    if len(classified) > 0 and "shift_related_velocity_change" in classified.columns:
+        parameter_rows.append(["shift_related_clusters", _html_escape(int(classified["shift_related_velocity_change"].sum()))])
+
+    text.append("<h3>Rolling velocity-change diagnostic parameters and counts</h3>")
+    text.append(_html_table(["Item", "Value"], parameter_rows))
+
+    transient_windows = result.get("transient_windows", pd.DataFrame())
+    text.append(_transient_windows_html(transient_windows))
+
+    joint_horizontal_transient_model_fits = result.get("joint_horizontal_transient_model_fits", pd.DataFrame())
+    text.append(_joint_horizontal_transient_model_fits_html(joint_horizontal_transient_model_fits))
+
+    transient_model_fits = result.get("transient_model_fits", pd.DataFrame())
+    text.append(_transient_model_fits_html(transient_model_fits))
+
+    if classified is None or len(classified) == 0:
+        text.append("<p>No persistent velocity-change clusters passed the current criteria.</p>")
+        return chr(10).join(text)
+
+    shift_related_report_grade = classified[
+        (classified.get("report_grade", False) == True)
+        & (classified.get("shift_related_velocity_change", False) == True)
+        & (classified.get("component", "") == "H_magnitude")
+    ].copy()
+
+    background_report_grade = classified[
+        (classified.get("report_grade", False) == True)
+        & (classified.get("shift_related_velocity_change", False) == False)
+        & (classified.get("component", "") == "H_magnitude")
+    ].copy()
+
+    vertical_diag = classified[
+        classified.get("component", "").astype(str) == "U_m"
+    ].copy()
+
+    text.append(_velocity_change_table_html(
+        shift_related_report_grade,
+        "Shift-related report-grade horizontal velocity changes",
+    ))
+
+    text.append(_velocity_change_table_html(
+        background_report_grade,
+        "Background report-grade horizontal velocity-change diagnostics",
+    ))
+
+    text.append(_velocity_change_table_html(
+        vertical_diag,
+        "Vertical diagnostic-only velocity changes",
+    ))
+
+    text.append(_velocity_change_table_html(
+        classified,
+        "All persistent velocity-change clusters",
+        max_rows=80,
+    ))
+
+    return chr(10).join(text)
+
 def build_timeseries_report(
     timeseries_path: str | Path,
     report_path: str | Path | None = None,
     metadata: dict | None = None,
     plot_columns=None,
     failed_datasets: list[dict] | None = None,
+    report_analysis_config: dict | None = None,
 ) -> dict:
     ts_path = Path(timeseries_path).expanduser().resolve()
 
@@ -1424,7 +5539,17 @@ def build_timeseries_report(
         if value:
             source_rows.append([_html_escape(key), _html_escape(value)])
 
+    analysis_cfg = _resolve_report_analysis_config(report_analysis_config)
+
     non_successful_html = _non_successful_datasets_html(failed_datasets)
+    shift_clusters = _compute_report_shift_clusters(df, analysis_cfg)
+    shift_clusters_html = _shift_clusters_html(shift_clusters)
+    meta_clusters = _compute_report_meta_clusters(shift_clusters, analysis_cfg)
+    meta_clusters_html = _meta_clusters_html(meta_clusters)
+    meta_cluster_velocity_windows = _compute_meta_cluster_velocity_windows(df, meta_clusters, analysis_cfg)
+    meta_cluster_velocity_windows_html = _meta_cluster_velocity_windows_html(meta_cluster_velocity_windows)
+    velocity_change_diagnostics = _compute_velocity_change_diagnostics(df, meta_clusters, analysis_cfg)
+    velocity_change_diagnostics_html = _velocity_change_diagnostics_html(velocity_change_diagnostics)
 
     html_text = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1570,8 +5695,23 @@ img.plot {{
 <h2>10. Final GNSS station coordinate solution from daily/per-file PPP solutions</h2>
 {_final_station_solution_html(df)}
 
-<h2>11. Plots requested by user</h2>
-{_plot_html(df, plot_columns=plot_columns, failed_datasets=failed_datasets)}
+<h2>11. Automatic shift detection</h2>
+{shift_clusters_html}
+
+<h2>12. Automatic meta-clustering of report-grade strict clusters</h2>
+{meta_clusters_html}
+
+<h2>13. Meta-cluster velocity windows</h2>
+{meta_cluster_velocity_windows_html}
+
+<h2>14. Velocity change diagnostics</h2>
+{velocity_change_diagnostics_html}
+
+<h2>15. Plots requested by user</h2>
+{_plot_html(df, plot_columns=plot_columns, failed_datasets=failed_datasets, shift_clusters=shift_clusters, meta_cluster_velocity_windows=meta_cluster_velocity_windows, velocity_change_diagnostics=velocity_change_diagnostics, report_analysis_config=analysis_cfg)}
+
+<h2>16. Shift-cluster zoom plots</h2>
+{_shift_cluster_zoom_plots_html(df, shift_clusters)}
 
 </body>
 </html>
@@ -1589,6 +5729,20 @@ img.plot {{
         "report_format": "html",
         "plot_columns": [column for _, column in _resolve_plot_columns(plot_columns)],
         "n_failed_datasets": int(len(failed_datasets)),
+        "n_shift_clusters": int(len(shift_clusters)) if shift_clusters is not None else 0,
+        "n_meta_clusters": int(len(meta_clusters)) if meta_clusters is not None else 0,
+        "n_meta_cluster_velocity_windows": int(len(meta_cluster_velocity_windows)) if meta_cluster_velocity_windows is not None else 0,
+        "n_velocity_change_clusters": int(len(velocity_change_diagnostics.get("classified", pd.DataFrame()))) if velocity_change_diagnostics else 0,
+        "n_transient_windows": int(len(velocity_change_diagnostics.get("transient_windows", pd.DataFrame()))) if velocity_change_diagnostics else 0,
+        "n_transient_model_fits": int(len(velocity_change_diagnostics.get("transient_model_fits", pd.DataFrame()))) if velocity_change_diagnostics else 0,
+        "n_joint_horizontal_transient_model_fits": int(len(velocity_change_diagnostics.get("joint_horizontal_transient_model_fits", pd.DataFrame()))) if velocity_change_diagnostics else 0,
+        "n_shift_related_report_grade_velocity_changes": int(
+            (
+                (velocity_change_diagnostics.get("classified", pd.DataFrame()).get("report_grade", pd.Series(dtype=bool)) == True)
+                & (velocity_change_diagnostics.get("classified", pd.DataFrame()).get("shift_related_velocity_change", pd.Series(dtype=bool)) == True)
+                & (velocity_change_diagnostics.get("classified", pd.DataFrame()).get("component", pd.Series(dtype=str)).astype(str) == "H_magnitude")
+            ).sum()
+        ) if velocity_change_diagnostics and len(velocity_change_diagnostics.get("classified", pd.DataFrame())) > 0 else 0,
     }
 
 

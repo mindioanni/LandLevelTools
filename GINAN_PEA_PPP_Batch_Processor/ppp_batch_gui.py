@@ -6,6 +6,7 @@ import importlib
 import io
 import os
 import queue
+import json
 import signal
 import subprocess
 import sys
@@ -15,21 +16,28 @@ from tkinter import filedialog, messagebox
 from tkinter import ttk
 
 
-PROJECT_DIR = Path(__file__).resolve().parent
-PYTHON_EXE = Path(sys.executable)
+PROJECT_DIR = Path("/home/ioannis/ppp_batch_orchestrator")
+PYTHON_EXE = Path("/home/ioannis/anaconda3/bin/python")
 BATCH_MAIN = PROJECT_DIR / "batch_main.py"
 
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-DEFAULT_RAW_ROOT = str(Path.home() / "data" / "RINEX" / "RAW")
-DEFAULT_STATIC_PRODUCTS_ROOT = str(Path.home() / "opt" / "ginan" / "ginan-gui-linux-x64" / "_internal" / "scripts" / "GinanUI" / "app" / "resources" / "inputData" / "products")
-DEFAULT_TEMPLATE_YAML_PATH = str(Path.home() / "opt" / "ginan" / "ginan-gui-linux-x64" / "_internal" / "scripts" / "GinanUI" / "app" / "resources" / "ppp_TG_GEIN_NOA_template.yaml")
+DEFAULT_RAW_ROOT = "/home/ioannis/data/RINEX/RAW"
+DEFAULT_STATIC_PRODUCTS_ROOT = "/home/ioannis/opt/ginan/ginan-gui-linux-x64/_internal/scripts/GinanUI/app/resources/inputData/products"
+DEFAULT_TEMPLATE_YAML_PATH = "/home/ioannis/opt/ginan/ginan-gui-linux-x64/_internal/scripts/GinanUI/app/resources/ppp_TG_GEIN_NOA_template.yaml"
 
 PPP_PROVIDERS = ["EMR", "COD", "WUM", "IGS", "GFZ", "GRG"]
 PPP_SERIES = ["FIN", "RAP"]
 PPP_PROJECTS = ["MGX", "OPS"]
-EXECUTION_MODES = ["run", "build_only"]
+EXECUTION_MODES = ["run", "build_only", "report_only", "report_from_timeseries"]
+
+EXECUTION_MODE_HELP_TEXT = (
+    "run: RINEX → PEA → POS → timeseries.out → report.html\n"
+    "build_only: products/YAML only; no PEA execution\n"
+    "report_only: existing POS outputs → rebuild timeseries.out → report.html\n"
+    "report_from_timeseries: existing timeseries.out → report.html only"
+)
 REPORT_PLOT_COLUMNS_HELP = "valid: X,Y,Z,lon,lat,h,E,N,U,all"
 YES_NO_OPTIONS = ["y", "n"]
 
@@ -56,6 +64,28 @@ class PPPBatchGUI(tk.Tk):
         self.overwrite_var = tk.StringVar(value="n")
         self.dataset_limit_var = tk.StringVar(value="all")
         self.generate_timeseries_report_var = tk.StringVar(value="y")
+
+        # Report analysis parameters
+        self.shift_window_days_var = tk.StringVar(value="28.0")
+        self.shift_mad_sigma_floor_m_var = tk.StringVar(value="0.005")
+        self.shift_min_abs_jump_m_var = tk.StringVar(value="0.005")
+        self.shift_min_jump_sigma_var = tk.StringVar(value="3.0")
+        self.shift_min_report_abs_jump_mm_var = tk.StringVar(value="20.0")
+
+        self.meta_max_gap_days_var = tk.StringVar(value="14.0")
+        self.meta_max_direction_change_deg_var = tk.StringVar(value="45.0")
+
+        self.velocity_min_stable_days_var = tk.StringVar(value="365.25")
+        self.velocity_gaussian_width_days_var = tk.StringVar(value="28.0")
+
+        # Rolling velocity-change diagnostics
+        self.rolling_velocity_window_days_var = tk.StringVar(value="182.0")
+        self.rolling_velocity_step_days_var = tk.StringVar(value="7.0")
+        self.rolling_velocity_comparison_lag_days_var = tk.StringVar(value="91.0")
+        self.rolling_velocity_z_threshold_var = tk.StringVar(value="4.0")
+        self.rolling_velocity_min_abs_delta_var = tk.StringVar(value="1.0")
+        self.rolling_velocity_persistence_fraction_var = tk.StringVar(value="0.5")
+        self.rolling_velocity_horizontal_coherence_var = tk.StringVar(value="y")
 
         self.plot_x_var = tk.BooleanVar(value=True)
         self.plot_y_var = tk.BooleanVar(value=True)
@@ -232,6 +262,126 @@ class PPPBatchGUI(tk.Tk):
         ttk.Checkbutton(plot_frame, text="U", variable=self.plot_u_var).grid(
             row=0, column=8, sticky="w", padx=(8, 0)
         )
+
+        analysis_frame = ttk.LabelFrame(root, text="Report analysis parameters", padding=10)
+        analysis_frame.pack(fill="x", pady=(10, 0))
+
+        ttk.Label(analysis_frame, text="Shift window days").grid(
+            row=0, column=0, sticky="w", padx=(0, 8), pady=3
+        )
+        ttk.Entry(analysis_frame, textvariable=self.shift_window_days_var, width=10).grid(
+            row=0, column=1, sticky="w", pady=3
+        )
+
+        ttk.Label(analysis_frame, text="MAD sigma floor (m)").grid(
+            row=0, column=2, sticky="w", padx=(20, 8), pady=3
+        )
+        ttk.Entry(analysis_frame, textvariable=self.shift_mad_sigma_floor_m_var, width=10).grid(
+            row=0, column=3, sticky="w", pady=3
+        )
+
+        ttk.Label(analysis_frame, text="Min abs jump (m)").grid(
+            row=0, column=4, sticky="w", padx=(20, 8), pady=3
+        )
+        ttk.Entry(analysis_frame, textvariable=self.shift_min_abs_jump_m_var, width=10).grid(
+            row=0, column=5, sticky="w", pady=3
+        )
+
+        ttk.Label(analysis_frame, text="Min jump sigma").grid(
+            row=1, column=0, sticky="w", padx=(0, 8), pady=3
+        )
+        ttk.Entry(analysis_frame, textvariable=self.shift_min_jump_sigma_var, width=10).grid(
+            row=1, column=1, sticky="w", pady=3
+        )
+
+        ttk.Label(analysis_frame, text="Min report jump (mm)").grid(
+            row=1, column=2, sticky="w", padx=(20, 8), pady=3
+        )
+        ttk.Entry(analysis_frame, textvariable=self.shift_min_report_abs_jump_mm_var, width=10).grid(
+            row=1, column=3, sticky="w", pady=3
+        )
+
+        ttk.Label(analysis_frame, text="Meta max gap days").grid(
+            row=1, column=4, sticky="w", padx=(20, 8), pady=3
+        )
+        ttk.Entry(analysis_frame, textvariable=self.meta_max_gap_days_var, width=10).grid(
+            row=1, column=5, sticky="w", pady=3
+        )
+
+        ttk.Label(analysis_frame, text="Direction tolerance (deg)").grid(
+            row=2, column=0, sticky="w", padx=(0, 8), pady=3
+        )
+        ttk.Entry(analysis_frame, textvariable=self.meta_max_direction_change_deg_var, width=10).grid(
+            row=2, column=1, sticky="w", pady=3
+        )
+
+        ttk.Label(analysis_frame, text="Min stable velocity days").grid(
+            row=2, column=2, sticky="w", padx=(20, 8), pady=3
+        )
+        ttk.Entry(analysis_frame, textvariable=self.velocity_min_stable_days_var, width=10).grid(
+            row=2, column=3, sticky="w", pady=3
+        )
+
+        ttk.Label(analysis_frame, text="Gaussian width days").grid(
+            row=2, column=4, sticky="w", padx=(20, 8), pady=3
+        )
+        ttk.Entry(analysis_frame, textvariable=self.velocity_gaussian_width_days_var, width=10).grid(
+            row=2, column=5, sticky="w", pady=3
+        )
+
+        ttk.Label(analysis_frame, text="Rolling velocity window days").grid(
+            row=3, column=0, sticky="w", padx=(0, 8), pady=3
+        )
+        ttk.Entry(analysis_frame, textvariable=self.rolling_velocity_window_days_var, width=10).grid(
+            row=3, column=1, sticky="w", pady=3
+        )
+
+        ttk.Label(analysis_frame, text="Rolling step days").grid(
+            row=3, column=2, sticky="w", padx=(20, 8), pady=3
+        )
+        ttk.Entry(analysis_frame, textvariable=self.rolling_velocity_step_days_var, width=10).grid(
+            row=3, column=3, sticky="w", pady=3
+        )
+
+        ttk.Label(analysis_frame, text="Comparison lag days").grid(
+            row=3, column=4, sticky="w", padx=(20, 8), pady=3
+        )
+        ttk.Entry(analysis_frame, textvariable=self.rolling_velocity_comparison_lag_days_var, width=10).grid(
+            row=3, column=5, sticky="w", pady=3
+        )
+
+        ttk.Label(analysis_frame, text="Velocity-change Z threshold").grid(
+            row=4, column=0, sticky="w", padx=(0, 8), pady=3
+        )
+        ttk.Entry(analysis_frame, textvariable=self.rolling_velocity_z_threshold_var, width=10).grid(
+            row=4, column=1, sticky="w", pady=3
+        )
+
+        ttk.Label(analysis_frame, text="Min |Δv| (mm/yr)").grid(
+            row=4, column=2, sticky="w", padx=(20, 8), pady=3
+        )
+        ttk.Entry(analysis_frame, textvariable=self.rolling_velocity_min_abs_delta_var, width=10).grid(
+            row=4, column=3, sticky="w", pady=3
+        )
+
+        ttk.Label(analysis_frame, text="Persistence fraction").grid(
+            row=4, column=4, sticky="w", padx=(20, 8), pady=3
+        )
+        ttk.Entry(analysis_frame, textvariable=self.rolling_velocity_persistence_fraction_var, width=10).grid(
+            row=4, column=5, sticky="w", pady=3
+        )
+
+        ttk.Label(analysis_frame, text="Horizontal coherence required").grid(
+            row=5, column=0, sticky="w", padx=(0, 8), pady=3
+        )
+        ttk.Combobox(
+            analysis_frame,
+            textvariable=self.rolling_velocity_horizontal_coherence_var,
+            values=YES_NO_OPTIONS,
+            state="readonly",
+            width=8,
+        ).grid(row=5, column=1, sticky="w", pady=3)
+
         cleanup_frame = ttk.LabelFrame(root, text="Cleanup generated files", padding=10)
         cleanup_frame.pack(fill="x", pady=(10, 0))
 
@@ -357,6 +507,39 @@ class PPPBatchGUI(tk.Tk):
         if not ok:
             return ok, message
 
+        execution_mode = self.execution_mode_var.get().strip()
+        report_only = execution_mode == "report_only"
+        report_from_timeseries = execution_mode == "report_from_timeseries"
+
+        if report_only or report_from_timeseries:
+            raw_root_path = Path(self.raw_root_var.get().strip()).expanduser()
+            ginan_process_dir = raw_root_path / "GINAN_process"
+
+            if not ginan_process_dir.exists() or not ginan_process_dir.is_dir():
+                return False, f"{execution_mode} mode requires an existing GINAN_process directory:\n{ginan_process_dir}"
+
+            if report_from_timeseries:
+                timeseries_path = ginan_process_dir / "timeseries.out"
+
+                if not timeseries_path.exists() or not timeseries_path.is_file():
+                    return False, f"report_from_timeseries mode requires an existing timeseries.out file:\n{timeseries_path}"
+
+            if len(self._selected_report_plot_columns()) == 0:
+                return False, "At least one report plot must be selected."
+
+            try:
+                self._build_report_analysis_config()
+            except ValueError as exc:
+                return False, str(exc)
+
+            if not PYTHON_EXE.exists() or not PYTHON_EXE.is_file():
+                return False, f"Python executable not found:\n{PYTHON_EXE}"
+
+            if not BATCH_MAIN.exists() or not BATCH_MAIN.is_file():
+                return False, f"batch_main.py not found:\n{BATCH_MAIN}"
+
+            return True, ""
+
         try:
             sample_rate = int(self.sample_rate_var.get().strip())
         except ValueError:
@@ -382,6 +565,10 @@ class PPPBatchGUI(tk.Tk):
         if len(self._selected_report_plot_columns()) == 0:
             return False, "At least one report plot must be selected."
 
+        try:
+            self._build_report_analysis_config()
+        except ValueError as exc:
+            return False, str(exc)
 
         static_products_root = self.static_products_root_var.get().strip()
 
@@ -431,6 +618,94 @@ class PPPBatchGUI(tk.Tk):
         if selected:
             self.template_yaml_path_var.set(selected)
 
+    def _float_from_var(self, var: tk.StringVar, label: str) -> float:
+        raw = var.get().strip()
+
+        if raw == "":
+            raise ValueError(f"{label} must not be empty.")
+
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise ValueError(f"{label} must be numeric.") from exc
+
+        return value
+
+    def _build_report_analysis_config(self) -> dict:
+        shift_window_days = self._float_from_var(self.shift_window_days_var, "Shift window days")
+        shift_mad_sigma_floor_m = self._float_from_var(self.shift_mad_sigma_floor_m_var, "MAD sigma floor")
+        shift_min_abs_jump_m = self._float_from_var(self.shift_min_abs_jump_m_var, "Min abs jump")
+        shift_min_jump_sigma = self._float_from_var(self.shift_min_jump_sigma_var, "Min jump sigma")
+        shift_min_report_abs_jump_mm = self._float_from_var(self.shift_min_report_abs_jump_mm_var, "Min report jump")
+        meta_max_gap_days = self._float_from_var(self.meta_max_gap_days_var, "Meta max gap days")
+        meta_max_direction_change_deg = self._float_from_var(self.meta_max_direction_change_deg_var, "Direction tolerance")
+        velocity_min_stable_days = self._float_from_var(self.velocity_min_stable_days_var, "Min stable velocity days")
+        velocity_gaussian_width_days = self._float_from_var(self.velocity_gaussian_width_days_var, "Gaussian width days")
+
+        rolling_velocity_window_days = self._float_from_var(self.rolling_velocity_window_days_var, "Rolling velocity window days")
+        rolling_velocity_step_days = self._float_from_var(self.rolling_velocity_step_days_var, "Rolling step days")
+        rolling_velocity_comparison_lag_days = self._float_from_var(self.rolling_velocity_comparison_lag_days_var, "Comparison lag days")
+        rolling_velocity_z_threshold = self._float_from_var(self.rolling_velocity_z_threshold_var, "Velocity-change Z threshold")
+        rolling_velocity_min_abs_delta = self._float_from_var(self.rolling_velocity_min_abs_delta_var, "Min |Δv|")
+        rolling_velocity_persistence_fraction = self._float_from_var(self.rolling_velocity_persistence_fraction_var, "Persistence fraction")
+        rolling_velocity_horizontal_coherence_required = (
+            self.rolling_velocity_horizontal_coherence_var.get().strip().lower() == "y"
+        )
+
+        if rolling_velocity_window_days <= 0:
+            raise ValueError("Rolling velocity window days must be positive.")
+        if rolling_velocity_step_days <= 0:
+            raise ValueError("Rolling step days must be positive.")
+        if rolling_velocity_comparison_lag_days <= 0:
+            raise ValueError("Comparison lag days must be positive.")
+        if rolling_velocity_z_threshold <= 0:
+            raise ValueError("Velocity-change Z threshold must be positive.")
+        if rolling_velocity_min_abs_delta < 0:
+            raise ValueError("Min |Δv| must be non-negative.")
+        if rolling_velocity_persistence_fraction <= 0:
+            raise ValueError("Persistence fraction must be positive.")
+
+        return {
+            "shift_detection": {
+                "window_days": shift_window_days,
+                "mad_sigma_floor_m": shift_mad_sigma_floor_m,
+                "min_abs_jump_m": shift_min_abs_jump_m,
+                "min_jump_sigma": shift_min_jump_sigma,
+            },
+            "shift_clustering": {
+                "cluster_window_days": meta_max_gap_days,
+            },
+            "shift_report_selection": {
+                "min_abs_jump_mm": shift_min_report_abs_jump_mm,
+            },
+            "meta_clustering": {
+                "max_gap_days": meta_max_gap_days,
+                "max_direction_change_deg": meta_max_direction_change_deg,
+            },
+            "velocity_windows": {
+                "min_duration_days_for_stable_rate": velocity_min_stable_days,
+                "gaussian_width_days": velocity_gaussian_width_days,
+            },
+            "rolling_velocity_diagnostics": {
+                "enabled": True,
+                "window_days": rolling_velocity_window_days,
+                "step_days": rolling_velocity_step_days,
+                "comparison_lag_days": rolling_velocity_comparison_lag_days,
+                "min_points_per_window": 20,
+                "apply_gaussian_smoothing": True,
+                "gaussian_width_days": velocity_gaussian_width_days,
+                "significance_z_threshold": rolling_velocity_z_threshold,
+                "min_abs_delta_velocity_mm_per_year": rolling_velocity_min_abs_delta,
+                "minimum_persistence_fraction_of_window": rolling_velocity_persistence_fraction,
+                "horizontal_coherence_required": rolling_velocity_horizontal_coherence_required,
+                "meta_association_window_days": None,
+                "include_horizontal_vector": True,
+            },
+            "plots": {
+                "gaussian_width_days": velocity_gaussian_width_days,
+            },
+        }
+
     def _build_stdin_payload(self) -> str:
         dataset_limit = self.dataset_limit_var.get().strip()
 
@@ -440,6 +715,11 @@ class PPPBatchGUI(tk.Tk):
             batch_limit_input = dataset_limit
 
         report_plot_columns = ",".join(self._selected_report_plot_columns())
+        report_analysis_config_json = json.dumps(
+            self._build_report_analysis_config(),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
 
         lines = [
             self.raw_root_var.get().strip(),
@@ -454,6 +734,7 @@ class PPPBatchGUI(tk.Tk):
             batch_limit_input,
             self.generate_timeseries_report_var.get().strip(),
             report_plot_columns,
+            report_analysis_config_json,
         ]
 
         return chr(10).join(lines) + chr(10)
@@ -473,11 +754,22 @@ class PPPBatchGUI(tk.Tk):
         self._append_output("\n=== Starting batch_main.py ===\n")
         self._append_output(f"Working directory: {PROJECT_DIR}\n")
         self._append_output(f"Command: {PYTHON_EXE} {BATCH_MAIN}\n")
-        self._append_output(f"Report plots: {', '.join(self._selected_report_plot_columns())}\n\n")
+        self._append_output(f"Execution mode: {self.execution_mode_var.get().strip()}\n")
+        self._append_output("Execution mode description:\n")
+        self._append_output(EXECUTION_MODE_HELP_TEXT + "\n")
+        self._append_output(f"Report plots: {', '.join(self._selected_report_plot_columns())}\n")
+        self._append_output(f"Report analysis config: {json.dumps(self._build_report_analysis_config(), sort_keys=True)}\n\n")
 
         self.run_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
-        self.status_var.set("Running batch processing...")
+        execution_mode = self.execution_mode_var.get().strip()
+
+        if execution_mode == "report_from_timeseries":
+            self.status_var.set("Generating report from existing timeseries.out...")
+        elif execution_mode == "report_only":
+            self.status_var.set("Generating report from existing outputs...")
+        else:
+            self.status_var.set("Running batch processing...")
 
         thread = threading.Thread(
             target=self._run_subprocess,

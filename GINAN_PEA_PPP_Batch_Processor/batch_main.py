@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 from pathlib import Path
 import sys
 
@@ -21,7 +22,7 @@ import position_timeseries
 import timeseries_report
 
 
-VALID_REPORT_PLOT_COLUMNS = {"X", "Y", "Z", "lon", "lat", "h"}
+VALID_REPORT_PLOT_COLUMNS = {"X", "Y", "Z", "lon", "lat", "h", "E", "N", "U"}
 
 
 def _safe_input(prompt: str) -> str:
@@ -132,6 +133,35 @@ def _parse_report_plot_columns(raw: str) -> list[str]:
             selected.append(canonical)
 
     return selected
+
+def write_run_manifest(dataset_context: dict) -> dict:
+    ctx = deepcopy(dataset_context)
+
+    manifest_path = ctx.get("outputs", {}).get("manifest_path")
+    if not manifest_path:
+        return {
+            "ok": False,
+            "message": "manifest_path is missing in dataset_context",
+            "manifest_path": "",
+        }
+
+    p = Path(manifest_path).expanduser().resolve()
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    ctx.setdefault("execution", {})
+    ctx["execution"]["manifest_written"] = True
+    ctx["execution"]["manifest_path"] = str(p)
+
+    with p.open("w", encoding="utf-8") as f:
+        json.dump(ctx, f, indent=2, ensure_ascii=False, sort_keys=True)
+
+    return {
+        "ok": True,
+        "message": "Run manifest written successfully.",
+        "manifest_path": str(p),
+    }
+
+
 def process_single_dataset(config: dict, dataset_context: dict) -> dict:
     ctx = deepcopy(dataset_context)
 
@@ -162,20 +192,37 @@ def process_single_dataset(config: dict, dataset_context: dict) -> dict:
         download_results = products_download.run_download_plan(download_plan)
 
         failed_downloads = [r for r in download_results if not r["ok"]]
-        if failed_downloads:
+
+        ctx = products_download.resolve_product_files(config, ctx)
+        product_validation = products_download.validate_product_files(ctx)
+
+        if failed_downloads or not product_validation["ok"]:
+            ctx = products_download.ensure_fallback_products_available(config, ctx)
+            ctx = products_download.resolve_product_files(config, ctx)
+            product_validation = products_download.validate_product_files(ctx)
+
+        if failed_downloads and not product_validation["ok"]:
             first = failed_downloads[0]
             raise RuntimeError(
                 f"Download step failed ({first['kind']} / {first['date']}) with return code {first['returncode']}"
             )
 
-        ctx["execution"]["downloads_completed"] = True
-
-        ctx = products_download.resolve_product_files(config, ctx)
-        product_validation = products_download.validate_product_files(ctx)
         if not product_validation["ok"]:
             raise FileNotFoundError(
                 "Missing product files: " + " | ".join(product_validation["missing"])
             )
+
+        ctx["execution"]["downloads_completed"] = len(failed_downloads) == 0
+
+        if failed_downloads:
+            ctx["execution"]["download_warnings"] = [
+                f"{r['kind']} / {r['date']} returned code {r['returncode']}"
+                for r in failed_downloads
+            ]
+
+        if ctx.get("products", {}).get("fallback_product_report"):
+            ctx["execution"]["fallback_products_used"] = True
+            ctx["execution"]["fallback_product_report"] = ctx["products"]["fallback_product_report"]
 
         ctx = yaml_builder.build_output_paths(config, ctx)
         yaml_text = yaml_builder.render_yaml_from_template(config, ctx)
@@ -188,6 +235,9 @@ def process_single_dataset(config: dict, dataset_context: dict) -> dict:
         if config["user_inputs"]["execution_mode"] == "build_only":
             ctx["execution"]["status"] = "BUILT"
             ctx["execution"]["message"] = "YAML built successfully. PEA execution skipped."
+            manifest_result = write_run_manifest(ctx)
+            ctx["execution"]["manifest_written"] = manifest_result["ok"]
+            ctx["execution"]["manifest_path"] = manifest_result["manifest_path"]
             return ctx
 
         run_result = pea_runner.run_pea(config, ctx)
@@ -204,6 +254,10 @@ def process_single_dataset(config: dict, dataset_context: dict) -> dict:
 
         if not validation_result["ok"]:
             raise RuntimeError(ctx["execution"]["message"])
+
+        manifest_result = write_run_manifest(ctx)
+        ctx["execution"]["manifest_written"] = manifest_result["ok"]
+        ctx["execution"]["manifest_path"] = manifest_result["manifest_path"]
 
         return ctx
 
@@ -371,13 +425,16 @@ def generate_timeseries_and_report(results: list[dict], config: dict) -> dict:
     print("----------------------------")
 
     report_plot_columns = config["user_inputs"].get("report_plot_columns", ["X", "Y", "Z", "h"])
+    report_analysis_config = config["user_inputs"].get("report_analysis_config", {})
     print(f"Report plots    : {', '.join(report_plot_columns)}")
+    print(f"Report analysis config supplied: {bool(report_analysis_config)}")
 
     report_result = timeseries_report.build_timeseries_report(
         timeseries_path=timeseries_path,
         report_path=ginan_process_dir / "timeseries.report",
         plot_columns=report_plot_columns,
         failed_datasets=failed_datasets,
+        report_analysis_config=config["user_inputs"].get("report_analysis_config", {}),
     )
 
     print(f"timeseries.report : {report_result['report_path']}")
@@ -404,8 +461,185 @@ def generate_timeseries_and_report(results: list[dict], config: dict) -> dict:
         "timeseries_result": ts_result,
         "report_result": report_result,
     }
+
+def generate_report_only_from_existing_outputs(config: dict) -> dict:
+    raw_root = Path(config["user_inputs"]["raw_root"]).expanduser().resolve()
+    ginan_process_dir = raw_root / "GINAN_process"
+
+    print("\nReport-only / post-processing-only mode")
+    print("---------------------------------------")
+    print(f"RAW root          : {raw_root}")
+    print(f"GINAN_process dir : {ginan_process_dir}")
+
+    if not ginan_process_dir.exists() or not ginan_process_dir.is_dir():
+        raise NotADirectoryError(f"GINAN_process directory does not exist: {ginan_process_dir}")
+
+    candidate_dirs = sorted(
+        p for p in ginan_process_dir.iterdir()
+        if p.is_dir()
+    )
+
+    run_dirs = []
+    skipped = []
+
+    for run_dir in candidate_dirs:
+        try:
+            position_timeseries.find_pos_files(run_dir, use_smoothed_pos=True)
+            run_dirs.append(run_dir)
+            continue
+        except Exception as exc_smoothed:
+            try:
+                position_timeseries.find_pos_files(run_dir, use_smoothed_pos=False)
+                run_dirs.append(run_dir)
+                continue
+            except Exception as exc_raw:
+                skipped.append((run_dir.name, str(exc_raw) or str(exc_smoothed)))
+
+    if not run_dirs:
+        raise RuntimeError(f"No existing PEA/POS run directories found under: {ginan_process_dir}")
+
+    timeseries_path = ginan_process_dir / "timeseries.out"
+    report_path = ginan_process_dir / "timeseries.report.html"
+
+    print()
+    print("Generating position timeseries from existing run outputs")
+    print("--------------------------------------------------------")
+    print(f"Detected run directories : {len(candidate_dirs)}")
+    print(f"Usable run directories   : {len(run_dirs)}")
+    print(f"Skipped directories      : {len(skipped)}")
+    print(f"Output timeseries        : {timeseries_path}")
+
+    if skipped:
+        print()
+        print("Directories skipped because no usable POS files were found:")
+        for name, reason in skipped[:30]:
+            print(f"  {name}: {reason}")
+        if len(skipped) > 30:
+            print(f"  ... {len(skipped) - 30} more skipped directories")
+
+    ts_result = position_timeseries.build_timeseries_out(
+        run_dirs=run_dirs,
+        output_path=timeseries_path,
+        convergence_config=None,
+        overwrite=True,
+    )
+
+    print(f"timeseries.out : {ts_result['output_path']}")
+    print(f"Rows           : {ts_result['n_rows']}")
+    print(f"ENU reference  : {ts_result['series_enu_reference_run_label']}")
+
+    print()
+    print("Generating timeseries report")
+    print("----------------------------")
+
+    report_plot_columns = config["user_inputs"].get("report_plot_columns", ["X", "Y", "Z", "h"])
+    report_analysis_config = config["user_inputs"].get("report_analysis_config", {})
+    print(f"Report plots   : {', '.join(report_plot_columns)}")
+    print(f"Report analysis config supplied: {bool(report_analysis_config)}")
+    print(f"Output report  : {report_path}")
+
+    report_result = timeseries_report.build_timeseries_report(
+        timeseries_path=timeseries_path,
+        report_path=report_path,
+        plot_columns=report_plot_columns,
+        failed_datasets=[],
+        report_analysis_config=config["user_inputs"].get("report_analysis_config", {}),
+    )
+
+    print(f"timeseries.report.html : {report_result['report_path']}")
+    print(f"Report format          : {report_result.get('report_format', '')}")
+    print(f"Report lines           : {report_result['n_report_lines']}")
+    print(f"Shift clusters         : {report_result.get('n_shift_clusters', '')}")
+    print(f"Meta clusters          : {report_result.get('n_meta_clusters', '')}")
+    print(f"Velocity change clusters: {report_result.get('n_velocity_change_clusters', '')}")
+    print(f"Transient windows: {report_result.get('n_transient_windows', '')}")
+    print(f"Component-wise transient model fits: {report_result.get('n_transient_model_fits', '')}")
+    print(f"Joint horizontal transient model fits: {report_result.get('n_joint_horizontal_transient_model_fits', '')}")
+    print(f"Shift-related report-grade velocity changes: {report_result.get('n_shift_related_report_grade_velocity_changes', '')}")
+
+    print()
+    print("Report-only generation completed successfully.")
+
+    return {
+        "ok": True,
+        "mode": "report_only",
+        "n_detected_run_dirs": len(candidate_dirs),
+        "n_used_run_dirs": len(run_dirs),
+        "n_skipped_run_dirs": len(skipped),
+        "timeseries_result": ts_result,
+        "report_result": report_result,
+    }
+
+
+
+def generate_report_from_existing_timeseries(config: dict) -> dict:
+    raw_root = Path(config["user_inputs"]["raw_root"]).expanduser().resolve()
+    ginan_process_dir = raw_root / "GINAN_process"
+    timeseries_path = ginan_process_dir / "timeseries.out"
+    report_path = ginan_process_dir / "timeseries.report.html"
+
+    print("\nReport-from-timeseries mode")
+    print("---------------------------")
+    print(f"RAW root          : {raw_root}")
+    print(f"GINAN_process dir : {ginan_process_dir}")
+    print(f"Input timeseries  : {timeseries_path}")
+    print(f"Output report     : {report_path}")
+
+    if not ginan_process_dir.exists() or not ginan_process_dir.is_dir():
+        raise NotADirectoryError(f"GINAN_process directory does not exist: {ginan_process_dir}")
+
+    if not timeseries_path.exists() or not timeseries_path.is_file():
+        raise FileNotFoundError(f"timeseries.out does not exist: {timeseries_path}")
+
+    print()
+    print("Generating timeseries report from existing timeseries.out")
+    print("---------------------------------------------------------")
+
+    report_plot_columns = config["user_inputs"].get("report_plot_columns", ["X", "Y", "Z", "h"])
+    report_analysis_config = config["user_inputs"].get("report_analysis_config", {})
+    print(f"Report plots   : {', '.join(report_plot_columns)}")
+    print(f"Report analysis config supplied: {bool(report_analysis_config)}")
+
+    report_result = timeseries_report.build_timeseries_report(
+        timeseries_path=timeseries_path,
+        report_path=report_path,
+        plot_columns=report_plot_columns,
+        failed_datasets=[],
+        report_analysis_config=config["user_inputs"].get("report_analysis_config", {}),
+    )
+
+    print(f"timeseries.report.html : {report_result['report_path']}")
+    print(f"Report format          : {report_result.get('report_format', '')}")
+    print(f"Report lines           : {report_result['n_report_lines']}")
+    print(f"Shift clusters         : {report_result.get('n_shift_clusters', '')}")
+    print(f"Meta clusters          : {report_result.get('n_meta_clusters', '')}")
+    print(f"Velocity change clusters: {report_result.get('n_velocity_change_clusters', '')}")
+    print(f"Transient windows: {report_result.get('n_transient_windows', '')}")
+    print(f"Component-wise transient model fits: {report_result.get('n_transient_model_fits', '')}")
+    print(f"Joint horizontal transient model fits: {report_result.get('n_joint_horizontal_transient_model_fits', '')}")
+    print(f"Shift-related report-grade velocity changes: {report_result.get('n_shift_related_report_grade_velocity_changes', '')}")
+
+    print()
+    print("Report-from-timeseries generation completed successfully.")
+
+    return {
+        "ok": True,
+        "mode": "report_from_timeseries",
+        "timeseries_path": str(timeseries_path),
+        "report_result": report_result,
+    }
+
+
 def main() -> None:
     config = collect_user_inputs()
+
+    if config["user_inputs"].get("execution_mode") == "report_from_timeseries":
+        generate_report_from_existing_timeseries(config)
+        return
+
+    if config["user_inputs"].get("execution_mode") == "report_only":
+        generate_report_only_from_existing_outputs(config)
+        return
 
     preflight = system_check.run_preflight_checks(config)
     print("\nPreflight check")
@@ -431,6 +665,28 @@ def main() -> None:
 # 3. YAML template path
 # 4. Remaining processing parameters
 
+
+def _prompt_report_analysis_config_json() -> dict:
+    prompt = "Report analysis config JSON [empty = defaults]: "
+
+    try:
+        raw = input(prompt).strip()
+    except EOFError:
+        return {}
+
+    if raw == "":
+        return {}
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid report analysis config JSON: {exc}") from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError("Report analysis config JSON must decode to an object/dict.")
+
+    return parsed
+
 def collect_user_inputs() -> dict:
     base_config = paths_config.get_default_config()
     system_cfg = base_config.get("system", {})
@@ -446,7 +702,7 @@ def collect_user_inputs() -> dict:
     print("This is usually located at:")
     print("  ~/ginan-gui-linux-x64/_internal/scripts/GinanUI/app/resources/inputData/products")
     print("or, in this system, possibly at:")
-    print("  ~/opt/ginan/ginan-gui-linux-x64/_internal/scripts/GinanUI/app/resources/inputData/products")
+    print("  /home/ioannis/opt/ginan/ginan-gui-linux-x64/_internal/scripts/GinanUI/app/resources/inputData/products")
 
     default_static_root = str(
         system_cfg.get("static_products_root", "")
@@ -488,7 +744,7 @@ def collect_user_inputs() -> dict:
     ).upper()
 
     execution_mode = _prompt_str(
-        "Enter execution mode (run or build_only)",
+        "Enter execution mode (run, build_only, report_only, or report_from_timeseries)",
         default=user_cfg.get("execution_mode", "run"),
     ).lower()
 
@@ -514,6 +770,8 @@ def collect_user_inputs() -> dict:
     )
     report_plot_columns = _parse_report_plot_columns(report_plot_columns_raw)
 
+    report_analysis_config = _prompt_report_analysis_config_json()
+
     updates = {
         "system": {
             "static_products_root": static_products_root,
@@ -530,6 +788,7 @@ def collect_user_inputs() -> dict:
             "limit_datasets": limit_datasets,
             "generate_timeseries_report": generate_timeseries_report,
             "report_plot_columns": report_plot_columns,
+            "report_analysis_config": report_analysis_config,
         },
     }
 
