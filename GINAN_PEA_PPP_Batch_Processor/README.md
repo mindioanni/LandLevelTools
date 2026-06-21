@@ -779,5 +779,3 @@ This version keeps the v1.3 SD/VCD reporting baseline and adds the stabilization
 - Deterministic RINEX3 observation-label normalization after GFZRNX conversion where generic `L1/L2/D1/D2/S1/S2` labels must be mapped to explicit PEA-compatible signal labels.
 - Dataset-specific `PRODUCT_STAGING/<dataset>` folders for isolated precise/static product inputs used by each generated YAML.
 - Required static-product staging now includes `tables/fes2014b_Cnm-Snm.dat` when the template requests the FES2014b ocean tide potential file.
-- The experimental user-provided ANTEX receiver-block logic is not part of this stabilized release; `igs20.atx` is treated as a frozen static model input.
-
