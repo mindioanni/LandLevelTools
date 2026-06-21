@@ -109,10 +109,17 @@ def _product_basename(item: str) -> str:
 def _looks_like_dynamic_crd_snx(item: str) -> bool:
     name = _product_basename(item).upper()
 
+    # IGS long filename convention, e.g.
+    # IGS0OPSSNX_20200010000_01D_01D_CRD.SNX
     if name.startswith("IGS0OPSSNX_") and name.endswith("_CRD.SNX"):
         return True
 
     if re.match(r"^IGS0OPSSNX_\d{11}_01D_01D_CRD\.SNX$", name):
+        return True
+
+    # Legacy weekly IGS SINEX convention, e.g.
+    # igs20P2086.snx -> IGS20P2086.SNX after uppercasing.
+    if re.match(r"^IGS\d{2}P\d{4}\.SNX$", name):
         return True
 
     return False
@@ -156,15 +163,15 @@ def _gui_style_nav_files() -> list[str]:
 
 
 def _gui_style_clk_files() -> list[str]:
-    return ["'*.CLK'"]
+    return ["'*.CLK'", "'*.clk'"]
 
 
 def _gui_style_bsx_files() -> list[str]:
-    return ["'*.BIA'"]
+    return ["'*.BIA'", "'*.bia'"]
 
 
 def _gui_style_sp3_files() -> list[str]:
-    return ["'*.SP3'"]
+    return ["'*.SP3'", "'*.sp3'"]
 
 
 def _replace_line_value(yaml_text: str, key: str, new_value: str) -> str:
@@ -258,7 +265,7 @@ def render_yaml_from_template(config: dict, dataset_context: dict) -> str:
     outputs_root = dataset_context["outputs"]["run_dir"]
 
     products = dataset_context.get("products", {})
-    products_root = products.get("igs_precise_dir")
+    products_root = products.get("product_staging_dir") or products.get("igs_precise_dir")
     dynamic_snx_files = products.get("snx_files", [])
 
     if not products_root:

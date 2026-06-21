@@ -118,6 +118,7 @@ def final_dataset_status(dataset_context: dict, validation_result: dict) -> dict
     ctx = deepcopy(dataset_context)
 
     ctx["execution"]["validation_passed"] = validation_result["ok"]
+    ctx["execution"]["run_output_validation"] = validation_result
 
     if validation_result["ok"]:
         ctx["execution"]["status"] = "SUCCESS"

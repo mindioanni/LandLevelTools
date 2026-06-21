@@ -14,55 +14,37 @@ def _format_datetime(dt: datetime) -> str:
 
 
 def _parse_rinex_time_fields(path: str) -> dict:
+    """
+    Read RINEX header time fields using rinex_header.parse_rinex_header().
+
+    This is intentionally delegated to rinex_header.py so that compressed
+    Hatanaka RINEX files such as *.??d.Z, *.??d.gz and *.crx.gz are handled
+    consistently across the whole batch workflow.
+    """
     p = Path(path).expanduser().resolve()
 
     if not p.exists():
         raise FileNotFoundError(f"RINEX file does not exist: {p}")
 
-    interval_sec = None
-    first_obs = None
-    last_obs = None
+    import rinex_header
 
-    with p.open("r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            label = line[60:].strip() if len(line) >= 60 else ""
+    header = rinex_header.parse_rinex_header(str(p))
 
-            if label == "INTERVAL":
-                try:
-                    interval_sec = int(round(float(line[:60].split()[0])))
-                except Exception:
-                    interval_sec = None
+    first_obs = header.get("time_first_obs", "")
+    last_obs = header.get("time_last_obs", "")
+    interval_sec = header.get("interval_sec", None)
 
-            elif label == "TIME OF FIRST OBS":
-                parts = line[:60].split()
-                if len(parts) >= 6:
-                    year, month, day, hour, minute = map(int, parts[:5])
-                    sec = float(parts[5])
-                    first_obs = datetime(year, month, day, hour, minute) + timedelta(seconds=sec)
-
-            elif label == "TIME OF LAST OBS":
-                parts = line[:60].split()
-                if len(parts) >= 6:
-                    year, month, day, hour, minute = map(int, parts[:5])
-                    sec = float(parts[5])
-                    last_obs = datetime(year, month, day, hour, minute) + timedelta(seconds=sec)
-
-            elif "END OF HEADER" in line:
-                break
-
-    if first_obs is None:
+    if not first_obs:
         raise ValueError(f"Could not read TIME OF FIRST OBS from: {p}")
 
-    if last_obs is None:
+    if not last_obs:
         raise ValueError(f"Could not read TIME OF LAST OBS from: {p}")
 
     return {
         "interval_sec": interval_sec,
-        "time_first_obs": _format_datetime(first_obs),
-        "time_last_obs": _format_datetime(last_obs),
+        "time_first_obs": first_obs,
+        "time_last_obs": last_obs,
     }
-
-
 def _apply_effective_observation_span(ctx: dict, rinex_file: str) -> dict:
     header = _parse_rinex_time_fields(rinex_file)
 
@@ -154,7 +136,12 @@ def build_resampled_paths(config: dict, dataset_context: dict) -> dict:
 
     raw_root = Path(ctx["raw"].get("raw_root") or raw_dataset_dir.parent).expanduser().resolve()
     resampled_root = raw_root / config["processing"]["resampled_folder_name"]
-    resampled_dataset_dir = resampled_root / raw_dataset_dir.name
+    dataset_folder_name = (
+        ctx.get("identity", {}).get("dataset_name")
+        or ctx.get("identity", {}).get("dataset_folder_name")
+        or raw_dataset_dir.name
+    )
+    resampled_dataset_dir = resampled_root / dataset_folder_name
 
     final_filename = _derive_resampled_filename(raw_filename, requested)
     temp_long_filename = _derive_temp_long_rinex_filename(
@@ -170,6 +157,124 @@ def build_resampled_paths(config: dict, dataset_context: dict) -> dict:
 
     return ctx
 
+
+
+def _format_rinex3_obs_types_line(system: str, obs_types: list[str]) -> str:
+    """
+    Format a RINEX3 SYS / # / OBS TYPES header line.
+
+    This helper is intentionally conservative and currently targets the
+    one-line OBS TYPE records produced by GFZRNX for the HEPOS/Trimble RINEX2
+    files used in this workflow.
+    """
+    body = f"{system}{len(obs_types):5d} " + " ".join(f"{obs:<3s}" for obs in obs_types)
+    return f"{body:<60s}SYS / # / OBS TYPES \n"
+
+
+def _normalize_pea_rinex3_obs_type_labels(rinex_file: Path) -> dict:
+    """
+    Normalize generic GFZRNX RINEX3 OBS TYPE labels so that Ginan/PEA can
+    recognise carrier-phase observables.
+
+    Observed issue:
+    GFZRNX may convert RINEX2 L1/L2/D1/D2/S1/S2 to generic RINEX3 labels
+    L1/L2/D1/D2/S1/S2. Ginan/PEA then reads code observables but does not
+    pass carrier phase measurements to the PPP filter.
+
+    This function only edits RINEX3 header lines:
+        SYS / # / OBS TYPES
+
+    It does not alter observation data records.
+    """
+    rinex_file = Path(rinex_file).expanduser().resolve()
+
+    if not rinex_file.exists():
+        return {
+            "applied": False,
+            "reason": f"File does not exist: {rinex_file}",
+            "changed_systems": [],
+        }
+
+    lines = rinex_file.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+
+    if not lines or "RINEX VERSION / TYPE" not in lines[0]:
+        return {
+            "applied": False,
+            "reason": "Not a RINEX file or missing RINEX VERSION / TYPE in first line.",
+            "changed_systems": [],
+        }
+
+    # Apply only to RINEX3/RINEX4 observation files.
+    version_token = lines[0][0:9].strip()
+    try:
+        version = float(version_token)
+    except ValueError:
+        version = 0.0
+
+    if version < 3.0:
+        return {
+            "applied": False,
+            "reason": f"RINEX version < 3: {version_token}",
+            "changed_systems": [],
+        }
+
+    maps = {
+        "G": {
+            "L1": "L1C",
+            "L2": "L2W",
+            "D1": "D1C",
+            "D2": "D2W",
+            "S1": "S1C",
+            "S2": "S2W",
+        },
+        "R": {
+            "L1": "L1C",
+            "L2": "L2C",
+            "D1": "D1C",
+            "D2": "D2C",
+            "S1": "S1C",
+            "S2": "S2C",
+        },
+    }
+
+    changed_systems = []
+    new_lines = []
+
+    for line in lines:
+        if "SYS / # / OBS TYPES" not in line:
+            new_lines.append(line)
+            continue
+
+        system = line[0:1]
+        if system not in maps:
+            new_lines.append(line)
+            continue
+
+        # This workflow currently handles one-line OBS TYPE records.
+        # For multi-line OBS TYPE records the original line is preserved.
+        obs_part = line[7:60]
+        obs_types = obs_part.split()
+
+        if not obs_types:
+            new_lines.append(line)
+            continue
+
+        normalized = [maps[system].get(obs, obs) for obs in obs_types]
+
+        if normalized != obs_types:
+            new_lines.append(_format_rinex3_obs_types_line(system, normalized))
+            changed_systems.append(system)
+        else:
+            new_lines.append(line)
+
+    if changed_systems:
+        rinex_file.write_text("".join(new_lines), encoding="utf-8")
+
+    return {
+        "applied": bool(changed_systems),
+        "reason": "ok" if changed_systems else "No generic OBS TYPE labels requiring normalization were found.",
+        "changed_systems": changed_systems,
+    }
 
 def run_resampling(config: dict, dataset_context: dict) -> dict:
     ctx = deepcopy(dataset_context)
@@ -280,8 +385,13 @@ def run_resampling(config: dict, dataset_context: dict) -> dict:
 # === PATCH: compact RINEX resampling support START ===
 def _is_compact_rinex_file(path: str | Path) -> bool:
     name = Path(path).name.lower()
+
     if name.endswith(".gz"):
         name = name[:-3]
+
+    if name.endswith(".z"):
+        name = name[:-2]
+
     return (
         name.endswith(".crx")
         or bool(__import__("re").search(r"\.\d{2}d$", name))
@@ -295,6 +405,9 @@ def _standard_rinex_name_from_raw(raw_filename: str, requested_interval_sec: int
 
     if name.lower().endswith(".gz"):
         name = name[:-3]
+
+    if name.lower().endswith(".z"):
+        name = name[:-2]
 
     lower = name.lower()
 
@@ -337,7 +450,12 @@ def build_resampled_paths(config: dict, dataset_context: dict) -> dict:
 
     raw_root = Path(ctx["raw"].get("raw_root") or raw_dataset_dir.parent).expanduser().resolve()
     resampled_root = raw_root / config["processing"]["resampled_folder_name"]
-    resampled_dataset_dir = resampled_root / raw_dataset_dir.name
+    dataset_folder_name = (
+        ctx.get("identity", {}).get("dataset_name")
+        or ctx.get("identity", {}).get("dataset_folder_name")
+        or raw_dataset_dir.name
+    )
+    resampled_dataset_dir = resampled_root / dataset_folder_name
 
     if not resample_needed:
         ctx["resampling"]["resampled_dataset_dir"] = str(raw_dataset_dir)
@@ -438,6 +556,8 @@ def run_resampling(config: dict, dataset_context: dict) -> dict:
 
     if compact_input and raw_interval == requested:
         shutil.copy2(normalized_file, final_file)
+        norm_result = _normalize_pea_rinex3_obs_type_labels(final_file)
+        ctx["resampling"]["pea_obs_type_normalization"] = norm_result
         ctx["execution"]["resample_performed"] = True
         ctx = _apply_effective_observation_span(ctx, str(final_file))
         return {
@@ -492,6 +612,9 @@ def run_resampling(config: dict, dataset_context: dict) -> dict:
         }
 
     shutil.move(str(temp_file), str(final_file))
+
+    norm_result = _normalize_pea_rinex3_obs_type_labels(final_file)
+    ctx["resampling"]["pea_obs_type_normalization"] = norm_result
 
     ctx["execution"]["resample_performed"] = True
     ctx = _apply_effective_observation_span(ctx, str(final_file))

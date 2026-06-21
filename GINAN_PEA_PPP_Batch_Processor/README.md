@@ -1,26 +1,26 @@
 # GINAN/pea PPP Batch Processor
 
-**User-facing program name:** GINAN/pea PPP Batch Processor
-**Internal project/module name:** `ppp_batch_orchestrator`
-**Version:** MVP v1.3-SD/VCD
-**Baseline:** C baseline — allGNSS / fallback / flexible-tree reference version with SD/VCD report diagnostics
-**Date:** 2026-06-08
+**User-facing program name:** GINAN/pea PPP Batch Processor  
+**Internal project/module name:** `ppp_batch_orchestrator`  
+**Version:** MVP v1.4-HEPOS-RINEX2/Product-Staging  
+**Baseline:** C baseline — allGNSS / fallback / flexible-tree reference version with SD/VCD report diagnostics; HEPOS RINEX2/Hatanaka compatibility and product staging stabilization  
+**Date:** 2026-06-21  
 
 ## Authors and AI-assisted development
 
 ### Primary author
 
-**Ioannis Mintourakis**
-Postdoctoral Researcher
-Hellenic National Tsunami Warning Centre
-Institute of Geodynamics
-National Observatory of Athens, Greece
-i.mintourakis@noa.gr
+**Ioannis Mintourakis**  
+Postdoctoral Researcher  
+Hellenic National Tsunami Warning Centre  
+Institute of Geodynamics  
+National Observatory of Athens, Greece  
+i.mintourakis@noa.gr  
 sealevelresearch@gmail.com
 
 ### AI-assisted development
 
-**R**
+**R**  
 
 “R” is the working name used by the author for OpenAI’s ChatGPT, inspired by Isaac Asimov’s Robot series.
 
@@ -259,49 +259,49 @@ The current workflow is organized into standalone Python modules.
 
 ### Core Python modules
 
-- `paths_config.py`
+- `paths_config.py`  
   Defines default system paths, user-input defaults, processing options and validation rules.
 
-- `rinex_header.py`
+- `rinex_header.py`  
   Discovers raw datasets, identifies RINEX observation files, parses RINEX headers, supports compact RINEX/header reading where applicable, supports updated discovery logic for non-standard station trees, and derives covered dates/day codes.
 
-- `resample_rinex.py`
+- `resample_rinex.py`  
   Plans and executes optional RINEX resampling using GFZRNX. The effective resampled observation window is used for subsequent YAML generation.
 
-- `products_download.py`
+- `products_download.py`  
   Defines product download plans, resolves product filenames, executes downloader calls, validates product availability, supports product reuse and fallback handling for legacy product cases.
 
-- `yaml_builder.py`
+- `yaml_builder.py`  
   Builds output paths and generates deterministic YAML files from the selected Ginan/PEA template.
 
-- `pea_runner.py`
+- `pea_runner.py`  
   Builds and executes the Ginan/PEA command and checks for early-stop conditions.
 
-- `results_check.py`
+- `results_check.py`  
   Collects run outputs, validates generated files, and summarizes `.POS` solution coverage.
 
-- `position_timeseries.py`
+- `position_timeseries.py`  
   Reads successful PEA/POS outputs, performs convergence analysis, extracts daily/per-file coordinate solutions, computes common ENU coordinates, and writes `timeseries.out`.
 
-- `timeseries_change_detection.py`
+- `timeseries_change_detection.py`  
   Implements Shift Detector (SD) utilities for identifying statistically significant position changes, representative shift epochs and shift clusters in the PPP time series.
 
-- `timeseries_velocity_detection.py`
+- `timeseries_velocity_detection.py`  
   Implements Velocity Change Detector (VCD) utilities for rolling/sliding velocity estimation, persistent horizontal velocity-change detection and automatic transient-window support.
 
-- `timeseries_report.py`
+- `timeseries_report.py`  
   Generates the HTML `timeseries.report.html`, including processing metadata, convergence settings, QC flags, daily/per-file solution summary, final coordinate statistics, plots, Shift Detector diagnostics, Velocity Change Detector diagnostics, transient windows and warnings for failed datasets.
 
-- `system_check.py`
+- `system_check.py`  
   Performs preflight checks for executables, required files, directory structure and writability.
 
-- `batch_main.py`
+- `batch_main.py`  
   Top-level orchestrator that connects all modules into a complete batch-processing workflow.
 
-- `ppp_batch_gui.py`
+- `ppp_batch_gui.py`  
   Tkinter graphical user interface for launching batch processing and configuring report diagnostics.
 
-- `cleanup_service.py`
+- `cleanup_service.py`  
   Helper module for cleanup-related operations, including preservation of the top-level `timeseries.out` and `timeseries.report.html` files.
 
 ### GUI / desktop launcher resources
@@ -322,12 +322,12 @@ GINAN_batch_processor.png
 
 ### Development / testing folder
 
-- `dev_notebooks/`
+- `dev_notebooks/`  
   Intended location for notebooks used for development, debugging, smoke tests and integration tests of the processor.
 
 ### Local archive folder
 
-- `ARCHIVED_STATES/`
+- `ARCHIVED_STATES/`  
   Local folder used to keep development backups, diagnostic snapshots, debug reports, cleanup quarantine material and historical code states.
 
 This folder is not required for normal execution and should normally not be committed to GitHub.
@@ -767,3 +767,19 @@ The current synchronized state includes:
 - Velocity Change Detector (VCD) report diagnostics,
 - automatic pre-event / event-incidence / post-event transient windows,
 - ENU composite plot overlays with green stable linear fits and thin orange dashed quadratic transient fits.
+
+
+
+## Version v1.4-HEPOS-RINEX2/Product-Staging stabilization notes
+
+This version keeps the v1.3 SD/VCD reporting baseline and adds the HEPOS-oriented stabilization changes required for RINEX2 / Compact RINEX processing with Ginan/PEA:
+
+- Flexible RINEX discovery for dataset folders and file-based station trees.
+- Compact RINEX / Hatanaka header handling for RINEX2 `.??d` files.
+- Fallback day-code derivation when daily Compact RINEX files omit `TIME OF LAST OBS`; this fallback is used only for product/date coverage, not as a claim that the final observation epoch is known from the header.
+- Deterministic RINEX3 observation-label normalization after GFZRNX conversion where generic `L1/L2/D1/D2/S1/S2` labels must be mapped to explicit PEA-compatible signal labels.
+- Dataset-specific `PRODUCT_STAGING/<dataset>` folders for isolated precise/static product inputs used by each generated YAML.
+- Required static-product staging now includes `tables/fes2014b_Cnm-Snm.dat` when the template requests the FES2014b ocean tide potential file.
+- The experimental user-provided ANTEX receiver-block logic is not part of this stabilized release; `igs20.atx` is treated as a frozen static model input.
+
+Validation reference: HEPOS station `088A`, 15 daily datasets `2026_106`–`2026_120`, COD FIN MGX products, 30 s processing, 15/15 successful PEA runs, successful `timeseries.out` and HTML report generation.

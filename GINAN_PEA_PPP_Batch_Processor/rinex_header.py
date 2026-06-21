@@ -89,31 +89,83 @@ def discover_raw_datasets(raw_root: str, limit: int | None = None) -> list[dict]
     if not raw_root_path.is_dir():
         raise NotADirectoryError(f"RAW root is not a directory: {raw_root_path}")
 
-    dataset_dirs = sorted(
-        p for p in raw_root_path.iterdir()
-        if p.is_dir() and p.name.lower().endswith(".rnx")
-    )
+    candidate_items = []
+
+    # Pass 1: classic one-level dataset directories.
+    # Example: RAW_ROOT/2025_141/file.rnx
+    for d in sorted(raw_root_path.iterdir()):
+        if not d.is_dir():
+            continue
+
+        if d.name.lower() in _WORKSPACE_DIR_NAMES:
+            continue
+
+        try:
+            raw_file = Path(find_observation_file(str(d))).expanduser().resolve()
+        except FileNotFoundError:
+            continue
+        except RuntimeError:
+            # If a directory contains many RINEX files, do not treat the directory
+            # itself as one dataset. Let the file-based pass handle each file.
+            continue
+
+        dataset_name = _make_dataset_name(raw_root_path, d, raw_file)
+        candidate_items.append((d, raw_file, dataset_name, d.name))
+
+    # Pass 2: file-based discovery.
+    # Handles:
+    # - root-level daily files: RAW_ROOT/*.crx.gz
+    # - nested files: RAW_ROOT/YYYY/ddd/*.??d.Z
+    if not candidate_items:
+        candidate_files = []
+
+        for pattern in _rinex_candidate_patterns():
+            candidate_files.extend(raw_root_path.rglob(pattern))
+
+        candidate_files = sorted(
+            p for p in candidate_files
+            if p.is_file()
+            and not _is_inside_workspace_dir(p, raw_root_path)
+            and _is_observation_rinex_file(p)
+        )
+
+        seen_logical = set()
+
+        for raw_file in candidate_files:
+            raw_file = raw_file.expanduser().resolve()
+            dataset_dir = raw_file.parent
+            dataset_name = _make_dataset_name(raw_root_path, dataset_dir, raw_file)
+
+            logical_key = (dataset_name, _strip_compression_suffix(raw_file).lower())
+            if logical_key in seen_logical:
+                continue
+
+            candidate_items.append((dataset_dir, raw_file, dataset_name, raw_file.name))
+            seen_logical.add(logical_key)
+
+    candidate_items = sorted(candidate_items, key=lambda item: item[2])
 
     if limit is not None:
-        dataset_dirs = dataset_dirs[:limit]
+        candidate_items = candidate_items[:limit]
 
     contexts = []
-    for dataset_dir in dataset_dirs:
+
+    for dataset_dir, raw_file, dataset_name, dataset_folder_name in candidate_items:
         ctx = _empty_dataset_context()
-        dataset_name = dataset_dir.name[:-4]
 
         ctx["identity"]["dataset_name"] = dataset_name
-        ctx["identity"]["dataset_folder_name"] = dataset_dir.name
+        ctx["identity"]["dataset_folder_name"] = dataset_folder_name
         ctx["raw"]["raw_root"] = str(raw_root_path)
         ctx["raw"]["raw_dataset_dir"] = str(dataset_dir)
-        ctx["raw"]["raw_rinex_file"] = find_observation_file(str(dataset_dir))
-        ctx["raw"]["raw_rinex_filename"] = Path(ctx["raw"]["raw_rinex_file"]).name
+        ctx["raw"]["raw_rinex_file"] = str(raw_file)
+        ctx["raw"]["raw_rinex_filename"] = raw_file.name
+        ctx["raw"]["raw_is_compact_rinex"] = _is_compact_rinex_file(raw_file)
+        ctx["raw"]["raw_is_gzip"] = raw_file.name.lower().endswith(".gz")
+        ctx["raw"]["raw_is_unix_compressed"] = raw_file.name.lower().endswith(".z")
 
         contexts.append(ctx)
 
     return contexts
-
-
 def find_observation_file(raw_dataset_dir: str) -> str:
     dataset_dir = Path(raw_dataset_dir).expanduser().resolve()
 
@@ -320,8 +372,25 @@ def enrich_dataset_with_header(dataset_context: dict, header_info: dict) -> dict
 
 
 def derive_covered_dates(time_first_obs: str, time_last_obs: str) -> tuple[list[str], list[str]]:
-    dt_first = datetime.strptime(time_first_obs, "%Y-%m-%d %H:%M:%S")
-    dt_last = datetime.strptime(time_last_obs, "%Y-%m-%d %H:%M:%S")
+    """
+    Derive covered calendar dates and YYYYDOY product day codes from RINEX
+    first/last observation epochs.
+
+    Some Compact RINEX / Hatanaka daily files, including HEPOS .YYd files,
+    may contain TIME OF FIRST OBS but omit TIME OF LAST OBS. In that case,
+    the file is treated as covering the calendar day of TIME OF FIRST OBS.
+    This fallback is used only for date/product coverage, not as a claim
+    that the last observation epoch is known from the header.
+    """
+    if not str(time_first_obs).strip():
+        raise ValueError("time_first_obs is missing or empty")
+
+    dt_first = datetime.strptime(str(time_first_obs).strip(), "%Y-%m-%d %H:%M:%S")
+
+    if str(time_last_obs).strip():
+        dt_last = datetime.strptime(str(time_last_obs).strip(), "%Y-%m-%d %H:%M:%S")
+    else:
+        dt_last = dt_first
 
     if dt_last < dt_first:
         raise ValueError("time_last_obs is earlier than time_first_obs")
@@ -352,15 +421,22 @@ _WORKSPACE_DIR_NAMES = {
 }
 
 
-def _strip_gzip_suffix(path: Path) -> str:
-    name = path.name
-    if name.lower().endswith(".gz"):
+def _strip_compression_suffix(path: Path) -> str:
+    name = Path(path).name
+    lower = name.lower()
+
+    if lower.endswith(".gz"):
         return name[:-3]
+
+    if lower.endswith(".z"):
+        return name[:-2]
+
     return name
 
 
 def _is_compact_rinex_file(path: str | Path) -> bool:
-    name = _strip_gzip_suffix(Path(path)).lower()
+    name = _strip_compression_suffix(Path(path)).lower()
+
     return (
         name.endswith(".crx")
         or bool(re.search(r"\.\d{2}d$", name))
@@ -369,7 +445,8 @@ def _is_compact_rinex_file(path: str | Path) -> bool:
 
 
 def _is_observation_rinex_file(path: str | Path) -> bool:
-    name = _strip_gzip_suffix(Path(path)).lower()
+    name = _strip_compression_suffix(Path(path)).lower()
+
     return (
         name.endswith(".rnx")
         or name.endswith(".crx")
@@ -379,15 +456,27 @@ def _is_observation_rinex_file(path: str | Path) -> bool:
     )
 
 
+def _is_inside_workspace_dir(path: Path, raw_root: Path) -> bool:
+    try:
+        rel_parts = path.relative_to(raw_root).parts
+    except ValueError:
+        rel_parts = path.parts
+
+    return any(part.lower() in _WORKSPACE_DIR_NAMES for part in rel_parts)
+
+
 def _read_rinex_text_for_header(rinex_path: str) -> str:
     p = Path(rinex_path).expanduser().resolve()
 
     if _is_compact_rinex_file(p):
         import hatanaka
+
         data = p.read_bytes()
         decompressed = hatanaka.decompress(data)
+
         if isinstance(decompressed, bytes):
             return decompressed.decode("utf-8", errors="ignore")
+
         return str(decompressed)
 
     if p.name.lower().endswith(".gz"):
@@ -395,6 +484,68 @@ def _read_rinex_text_for_header(rinex_path: str) -> str:
             return f.read()
 
     return p.read_text(encoding="utf-8", errors="ignore")
+
+
+def _rinex_candidate_patterns() -> list[str]:
+    return [
+        "*.??o", "*.??O", "*.rnx", "*.RNX",
+        "*.??o.gz", "*.??O.gz", "*.rnx.gz", "*.RNX.gz",
+        "*.??o.Z", "*.??O.Z", "*.rnx.Z", "*.RNX.Z",
+
+        "*.crx", "*.CRX", "*.??d", "*.??D", "*.d", "*.D",
+        "*.crx.gz", "*.CRX.gz", "*.??d.gz", "*.??D.gz", "*.d.gz", "*.D.gz",
+        "*.crx.Z", "*.CRX.Z", "*.??d.Z", "*.??D.Z", "*.d.Z", "*.D.Z",
+    ]
+
+
+def _dataset_name_from_file(raw_file: Path) -> str:
+    name = raw_file.name
+
+    # RINEX 3 long filename, e.g.
+    # DELO00GRC_R_20251410000_01D_30S_MO.crx.gz -> 2025_141
+    m = re.search(r"(19\d{2}|20\d{2})(\d{3})\d{4}", name)
+    if m:
+        return f"{m.group(1)}_{m.group(2)}"
+
+    stripped = _strip_compression_suffix(raw_file)
+
+    # RINEX 2 short filename, e.g.
+    # sant0010.20d -> 2020_001
+    m = re.search(r"^[a-zA-Z0-9]{4}(\d{3})\d\.(\d{2})[odOD]$", stripped)
+    if m:
+        yy = int(m.group(2))
+        yyyy = 2000 + yy if yy < 80 else 1900 + yy
+        return f"{yyyy}_{m.group(1)}"
+
+    stem = stripped
+    for suffix in [".crx", ".CRX", ".rnx", ".RNX"]:
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+
+    return stem
+
+
+def _make_dataset_name(raw_root_path: Path, dataset_dir: Path, raw_file: Path | None = None) -> str:
+    dataset_dir = Path(dataset_dir).expanduser().resolve()
+
+    try:
+        rel_dir = dataset_dir.relative_to(raw_root_path)
+        dir_parts = rel_dir.parts
+    except ValueError:
+        dir_parts = dataset_dir.parts
+
+    # Nested YYYY/ddd layout.
+    if len(dir_parts) >= 2 and re.fullmatch(r"\d{4}", dir_parts[0]) and re.fullmatch(r"\d{3}", dir_parts[1]):
+        return f"{dir_parts[0]}_{dir_parts[1]}"
+
+    if raw_file is not None:
+        return _dataset_name_from_file(Path(raw_file))
+
+    name = dataset_dir.name
+    if name.lower().endswith(".rnx"):
+        name = name[:-4]
+
+    return name
 
 
 def discover_raw_datasets(raw_root: str, limit: int | None = None) -> list[dict]:
@@ -405,40 +556,78 @@ def discover_raw_datasets(raw_root: str, limit: int | None = None) -> list[dict]
     if not raw_root_path.is_dir():
         raise NotADirectoryError(f"RAW root is not a directory: {raw_root_path}")
 
-    candidate_dirs = []
+    candidate_items = []
 
-    for p in sorted(raw_root_path.iterdir()):
-        if not p.is_dir():
+    # Pass 1: classic one-level dataset directories.
+    # Example: RAW_ROOT/2025_141/file.rnx
+    for d in sorted(raw_root_path.iterdir()):
+        if not d.is_dir():
             continue
 
-        if p.name.lower() in _WORKSPACE_DIR_NAMES:
+        if d.name.lower() in _WORKSPACE_DIR_NAMES:
             continue
 
         try:
-            _ = find_observation_file(str(p))
+            raw_file = Path(find_observation_file(str(d))).expanduser().resolve()
         except FileNotFoundError:
             continue
+        except RuntimeError:
+            # Directory contains multiple RINEX files; handle them as separate
+            # datasets in the file-based pass below.
+            continue
 
-        candidate_dirs.append(p)
+        dataset_name = _make_dataset_name(raw_root_path, d, raw_file)
+        candidate_items.append((d, raw_file, dataset_name, d.name))
+
+    # Pass 2: file-based discovery.
+    # Handles:
+    # - root-level daily files: RAW_ROOT/*.crx.gz
+    # - nested files: RAW_ROOT/YYYY/ddd/*.??d.Z
+    if not candidate_items:
+        candidate_files = []
+
+        for pattern in _rinex_candidate_patterns():
+            candidate_files.extend(raw_root_path.rglob(pattern))
+
+        candidate_files = sorted(
+            f.expanduser().resolve()
+            for f in candidate_files
+            if f.is_file()
+            and not _is_inside_workspace_dir(f, raw_root_path)
+            and _is_observation_rinex_file(f)
+        )
+
+        seen = set()
+
+        for raw_file in candidate_files:
+            dataset_dir = raw_file.parent
+            dataset_name = _make_dataset_name(raw_root_path, dataset_dir, raw_file)
+
+            if dataset_name in seen:
+                continue
+
+            candidate_items.append((dataset_dir, raw_file, dataset_name, raw_file.name))
+            seen.add(dataset_name)
+
+    candidate_items = sorted(candidate_items, key=lambda item: item[2])
 
     if limit is not None:
-        candidate_dirs = candidate_dirs[:limit]
+        candidate_items = candidate_items[:limit]
 
     contexts = []
-    for dataset_dir in candidate_dirs:
+
+    for dataset_dir, raw_file, dataset_name, dataset_folder_name in candidate_items:
         ctx = _empty_dataset_context()
 
-        dataset_name = dataset_dir.name[:-4] if dataset_dir.name.lower().endswith(".rnx") else dataset_dir.name
-        raw_file = Path(find_observation_file(str(dataset_dir))).expanduser().resolve()
-
         ctx["identity"]["dataset_name"] = dataset_name
-        ctx["identity"]["dataset_folder_name"] = dataset_dir.name
+        ctx["identity"]["dataset_folder_name"] = dataset_folder_name
         ctx["raw"]["raw_root"] = str(raw_root_path)
         ctx["raw"]["raw_dataset_dir"] = str(dataset_dir)
         ctx["raw"]["raw_rinex_file"] = str(raw_file)
         ctx["raw"]["raw_rinex_filename"] = raw_file.name
         ctx["raw"]["raw_is_compact_rinex"] = _is_compact_rinex_file(raw_file)
         ctx["raw"]["raw_is_gzip"] = raw_file.name.lower().endswith(".gz")
+        ctx["raw"]["raw_is_unix_compressed"] = raw_file.name.lower().endswith(".z")
 
         contexts.append(ctx)
 
@@ -453,15 +642,8 @@ def find_observation_file(raw_dataset_dir: str) -> str:
     if not dataset_dir.is_dir():
         raise NotADirectoryError(f"Dataset path is not a directory: {dataset_dir}")
 
-    candidate_patterns = [
-        "*.??o", "*.??O", "*.rnx", "*.RNX",
-        "*.??o.gz", "*.??O.gz", "*.rnx.gz", "*.RNX.gz",
-        "*.crx", "*.CRX", "*.??d", "*.??D", "*.d", "*.D",
-        "*.crx.gz", "*.CRX.gz", "*.??d.gz", "*.??D.gz", "*.d.gz", "*.D.gz",
-    ]
-
     matches = []
-    for pattern in candidate_patterns:
+    for pattern in _rinex_candidate_patterns():
         matches.extend(dataset_dir.glob(pattern))
 
     matches = sorted(p for p in matches if p.is_file() and _is_observation_rinex_file(p))
@@ -470,7 +652,7 @@ def find_observation_file(raw_dataset_dir: str) -> str:
         raise FileNotFoundError(f"No observation file found in dataset directory: {dataset_dir}")
 
     def logical_name(p: Path) -> str:
-        return _strip_gzip_suffix(p).lower()
+        return _strip_compression_suffix(p).lower()
 
     logical_groups = {}
     for p in matches:
@@ -483,9 +665,16 @@ def find_observation_file(raw_dataset_dir: str) -> str:
 
     group = list(logical_groups.values())[0]
 
-    uncompressed = [p for p in group if not p.name.lower().endswith(".gz")]
+    uncompressed = [
+        p for p in group
+        if not p.name.lower().endswith(".gz") and not p.name.lower().endswith(".z")
+    ]
     if uncompressed:
         return str(sorted(uncompressed)[0])
+
+    gzip_files = [p for p in group if p.name.lower().endswith(".gz")]
+    if gzip_files:
+        return str(sorted(gzip_files)[0])
 
     return str(sorted(group)[0])
 
