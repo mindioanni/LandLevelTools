@@ -2,8 +2,8 @@
 
 **User-facing program name:** GINAN/pea PPP Batch Processor
 **Internal project/module name:** `ppp_batch_orchestrator`
-**Version:** MVP v1.4-HEPOS-RINEX2/Product-Staging
-**Baseline:** C baseline — allGNSS / fallback / flexible-tree reference version with SD/VCD report diagnostics; HEPOS RINEX2/Hatanaka compatibility and product staging stabilization
+**Version:** MVP v1.4-RINEX2/Product-Staging
+**Baseline:** C baseline — allGNSS / fallback / flexible-tree reference version with SD/VCD report diagnostics; RINEX 2 / Compact RINEX / Hatanaka compatibility and product staging stabilization
 **Date:** 2026-06-21
 
 ## Authors and AI-assisted development
@@ -68,7 +68,6 @@ The current MVP v1.3-SD/VCD implementation supports the following processing and
 24. Automatic pre-event / event-incidence / post-event transient-window reporting.
 25. ENU composite full-span plot with stable linear fits and quadratic transient fits.
 
-The C baseline is intended to support station folder trees that do not necessarily follow the same layout as ASTY or DELO. This is relevant for SANT-like datasets and other legacy station archives.
 
 ## Processing Model
 
@@ -770,9 +769,9 @@ The current synchronized state includes:
 
 
 
-## Version v1.4-HEPOS-RINEX2/Product-Staging stabilization notes
+## Version v1.4-RINEX2/Product-Staging stabilization notes
 
-This version keeps the v1.3 SD/VCD reporting baseline and adds the HEPOS-oriented stabilization changes required for RINEX2 / Compact RINEX processing with Ginan/PEA:
+This version keeps the v1.3 SD/VCD reporting baseline and adds the stabilization changes required for RINEX 2 / Compact RINEX processing with Ginan/PEA:
 
 - Flexible RINEX discovery for dataset folders and file-based station trees.
 - Compact RINEX / Hatanaka header handling for RINEX2 `.??d` files.
@@ -782,4 +781,3 @@ This version keeps the v1.3 SD/VCD reporting baseline and adds the HEPOS-oriente
 - Required static-product staging now includes `tables/fes2014b_Cnm-Snm.dat` when the template requests the FES2014b ocean tide potential file.
 - The experimental user-provided ANTEX receiver-block logic is not part of this stabilized release; `igs20.atx` is treated as a frozen static model input.
 
-Validation reference: HEPOS station `088A`, 15 daily datasets `2026_106`–`2026_120`, COD FIN MGX products, 30 s processing, 15/15 successful PEA runs, successful `timeseries.out` and HTML report generation.
